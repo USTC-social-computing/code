@@ -28,9 +28,9 @@
 └── word.tsv
 ```
 
-| 类型 | user | group | city | topic                        | word                         |
-| ---- | ---- | ----- | ---- | ---------------------------- | ---------------------------- |
-| 数量 | 4    | 3     | 4    | 6（包含 0 号位置的 padding） | 5（包含 0 号位置的 padding） |
+| 类型 | user | group | city                         | topic                        | word                         |
+| ---- | ---- | ----- | ---------------------------- | ---------------------------- | ---------------------------- |
+| 数量 | 4    | 3     | 4（包含 0 号位置的 unknown） | 6（包含 0 号位置的 padding） | 5（包含 0 号位置的 padding） |
 
 
 
@@ -38,7 +38,7 @@
 
 **注意事项：**
 
-- topic 和 word 设置了 padding 位，即 0 号位表示 padding，topic 和 word 数量为真实数量加一。另外注意 `word.tsv` 的 `index` 列从 1 开始而不是 0，因为 0 号位置是 padding 位。
+- city 设置了 unknown 位、topic 和 word 设置了 padding 位，即 0 号位表示 unknown/padding，city、topic 和 word 数量为真实数量加一。另外注意 `word.tsv` 的 `index` 列从 1 开始而不是 0，因为 0 号位置是 padding 位。
 
 - 数据组同学只需要分好数个时间周期的数据即可，具体 train/val/test 的划分由代码组同学来确定（例如这里的示例数据包含了 5 个时间周期的数据，代码组可以按 3/1/1 来划分 train/val/test）。
 
