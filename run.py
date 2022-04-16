@@ -24,10 +24,10 @@ from torch.utils.data import Dataset, DataLoader
 # %%
 # config
 DATA_PATH = "./example_data"
-GLOVE_PATH = "/home/yflyl/glove.840B.300d.txt"
+GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
 MODEL_DIR = "../../model_all"
-NUM_CITY = 100
-NUM_TOPIC = 100
+NUM_CITY = 2675
+NUM_TOPIC = 18114
 CITY_EMB_DIM = 50
 TOPIC_EMB_DIM = 50
 USER_ID_EMB_DIM = 50
@@ -37,8 +37,8 @@ USER_EMB_DIM = 256
 GROUP_EMB_DIM = 256
 WORD_EMB_DIM = 300
 # The max number of words in descption. None happens if num_word < max.
-NUM_GROUP_DESC = 200
-NUM_EVENT_DESC = 200
+NUM_GROUP_DESC = 190
+NUM_EVENT_DESC = 280
 DROP_RATIO = 0.1
 BATCH_SIZE = 32
 LR = 0.01
@@ -55,6 +55,7 @@ for line in tqdm(word_file):
     word_dict[word] = int(idx)
 
 word_embedding = np.random.uniform(size=(len(word_dict), WORD_EMB_DIM))
+have_word = 0
 try:
     with open(GLOVE_PATH, 'rb') as f:
         for line in tqdm(f):
@@ -64,11 +65,14 @@ try:
                 idx = word_dict[word]
                 tp = [float(x) for x in line[1:]]
                 word_embedding[idx] = np.array(tp)
+                have_word += 1
 except FileNotFoundError:
     print('Warning: Glove file not found.')
 word_embedding = torch.from_numpy(word_embedding).float()
 
 print(f'Word dict length: {len(word_dict)}')
+print(f'Have words: {have_word}')
+print(f'Missing rate: {(len(word_dict) - have_word) / len(word_dict)}')
 
 # %%
 # get user dict
@@ -116,7 +120,7 @@ for behavior_file, user_group_file, user_user_file in \
               encoding='utf-8') as f:
         behavior_file = f.readlines()[1:]
     for line in tqdm(behavior_file):
-        group, city, desc, user, label = line.strip('\n').split('\t')
+        _, group, city, desc, user, label = line.strip('\n').split('\t')
         behavior_data.append(
             (int(city), eval(desc)[:NUM_EVENT_DESC], int(user), int(group),
              int(label)))
@@ -172,7 +176,6 @@ for idx in range(1, total_time_period):
 
 # %%
 class MyDataset(Dataset):
-
     def __init__(self, behavior):
         super().__init__()
         (city, desc, user, user_topic, user_city, group, group_topic,
@@ -222,7 +225,6 @@ def acc(y_true, y_hat):
 # %%
 # define model
 class AttentionPooling(nn.Module):
-
     def __init__(self, emb_size, hidden_size):
         super().__init__()
         self.att_fc1 = nn.Linear(emb_size, hidden_size)
@@ -250,7 +252,6 @@ class AttentionPooling(nn.Module):
 
 
 class TextEncoder(nn.Module):
-
     def __init__(self, word_embedding):
         super().__init__()
         self.word_embedding = nn.Embedding.from_pretrained(word_embedding,
@@ -272,7 +273,6 @@ class TextEncoder(nn.Module):
 
 
 class TopicEncoder(nn.Module):
-
     def __init__(self):
         super().__init__()
         self.topic_embedding = nn.Embedding(NUM_TOPIC, TOPIC_EMB_DIM)
@@ -289,7 +289,6 @@ class TopicEncoder(nn.Module):
 
 
 class Model(nn.Module):
-
     def __init__(self, word_embedding):
         super().__init__()
         self.city_emb = nn.Embedding(NUM_CITY, CITY_EMB_DIM)
