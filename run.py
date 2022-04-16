@@ -33,6 +33,8 @@ TOPIC_EMB_DIM = 50
 USER_ID_EMB_DIM = 50
 GROUP_ID_EMB_DIM = 50
 DESC_DIM = 100
+USER_EMB_DIM = 256
+GROUP_EMB_DIM = 256
 WORD_EMB_DIM = 300
 # The max number of words in descption. None happens if num_word < max.
 NUM_GROUP_DESC = 200
@@ -52,8 +54,7 @@ for line in tqdm(word_file):
     idx, word = line.strip('\n').split('\t')
     word_dict[word] = int(idx)
 
-word_embedding = np.zeros(shape=(len(word_dict) + 1, WORD_EMB_DIM))
-have_word = 0
+word_embedding = np.random.uniform(size=(len(word_dict), WORD_EMB_DIM))
 try:
     with open(GLOVE_PATH, 'rb') as f:
         for line in tqdm(f):
@@ -63,14 +64,11 @@ try:
                 idx = word_dict[word]
                 tp = [float(x) for x in line[1:]]
                 word_embedding[idx] = np.array(tp)
-                have_word += 1
 except FileNotFoundError:
     print('Warning: Glove file not found.')
 word_embedding = torch.from_numpy(word_embedding).float()
 
 print(f'Word dict length: {len(word_dict)}')
-print(f'Have words: {have_word}')
-print(f'Missing rate: {(len(word_dict) - have_word) / len(word_dict)}')
 
 # %%
 # get user dict
@@ -80,7 +78,8 @@ with open(os.path.join(DATA_PATH, 'user.tsv'), 'r', encoding='utf-8') as f:
 user_dict = {}
 for line in tqdm(user_file):
     idx, topic_list, city = line.strip('\n').split('\t')
-    user_dict[int(idx)] = (eval(topic_list), int(city))
+    topic_list = [int(x) for x in topic_list.split(' ')]
+    user_dict[int(idx)] = (topic_list, int(city))
 
 NUM_USER = len(user_dict)
 print(f'Total user num: {NUM_USER}')
@@ -93,30 +92,38 @@ with open(os.path.join(DATA_PATH, 'group.tsv'), 'r', encoding='utf-8') as f:
 group_dict = {}
 for line in tqdm(group_file):
     idx, topic_list, city, desc = line.strip('\n').split('\t')
-    group_dict[int(idx)] = (eval(topic_list), int(city),
-                            eval(desc)[:NUM_GROUP_DESC])
+    topic_list = [int(x) for x in topic_list.split(' ')]
+    desc = [int(x) for x in desc.split(' ')]
+    group_dict[int(idx)] = (topic_list, int(city), desc[:NUM_GROUP_DESC])
 
 NUM_GROUP = len(group_dict)
 print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-total_time_period = len(os.listdir(os.path.join(DATA_PATH, 'behaviors')))
+total_behavior_file = sorted(os.listdir(os.path.join(DATA_PATH, 'behaviors')))
+total_user_group_file = sorted(
+    os.listdir(os.path.join(DATA_PATH, 'links/user-group')))
+total_user_user_file = sorted(
+    os.listdir(os.path.join(DATA_PATH, 'links/user-user')))
+
+total_time_period = len(total_behavior_file)
 total_behavior, total_user_group, total_user_user = [], [], []
 
-for idx in range(total_time_period):
+for behavior_file, user_group_file, user_user_file in \
+        zip(total_behavior_file, total_user_group_file, total_user_user_file):
     behavior_data = []
-    with open(os.path.join(DATA_PATH, f'behaviors/{idx}.tsv'),
+    with open(os.path.join(DATA_PATH, f'behaviors/{behavior_file}'),
               'r',
               encoding='utf-8') as f:
         behavior_file = f.readlines()[1:]
     for line in tqdm(behavior_file):
         city, desc, user, group, label = line.strip('\n').split('\t')
-        behavior_data.append(
-            (int(city), eval(desc)[:NUM_EVENT_DESC], int(user), int(group),
-             int(label)))
+        desc = [int(x) for x in desc.split(' ')]
+        behavior_data.append((int(city), desc[:NUM_EVENT_DESC], int(user),
+                              int(group), int(label)))
     total_behavior.append(behavior_data)
-    with open(os.path.join(DATA_PATH, f'links/user-group/{idx}.pickle'),
+    with open(os.path.join(DATA_PATH, f'links/user-group/{user_group_file}'),
               'rb') as f:
         user_group_data = pickle.load(f)
         user_group_data = torch.sparse_coo_tensor(
@@ -124,7 +131,7 @@ for idx in range(total_time_period):
             user_group_data['data'], (NUM_USER, NUM_GROUP),
             dtype=torch.float32)
         total_user_group.append(user_group_data)
-    with open(os.path.join(DATA_PATH, f'links/user-user/{idx}.pickle'),
+    with open(os.path.join(DATA_PATH, f'links/user-user/{user_user_file}'),
               'rb') as f:
         user_user_data = pickle.load(f)
         user_user_data = torch.sparse_coo_tensor(
@@ -160,13 +167,14 @@ total_user_group = [torch.sparse_coo_tensor(size=(NUM_USER, NUM_GROUP))
 total_user_user = [torch.sparse_coo_tensor(size=(NUM_USER, NUM_USER))
                    ] + total_user_user[:-1]
 
-for idx in range(2, total_time_period):
+for idx in range(1, total_time_period):
     total_user_group[idx] += total_user_group[idx - 1] * DECAY_RATE
     total_user_user[idx] += total_user_user[idx - 1] * DECAY_RATE
 
 
 # %%
 class MyDataset(Dataset):
+
     def __init__(self, behavior):
         super().__init__()
         (city, desc, user, user_topic, user_city, group, group_topic,
@@ -216,6 +224,7 @@ def acc(y_true, y_hat):
 # %%
 # define model
 class AttentionPooling(nn.Module):
+
     def __init__(self, emb_size, hidden_size):
         super().__init__()
         self.att_fc1 = nn.Linear(emb_size, hidden_size)
@@ -243,6 +252,7 @@ class AttentionPooling(nn.Module):
 
 
 class TextEncoder(nn.Module):
+
     def __init__(self, word_embedding):
         super().__init__()
         self.word_embedding = nn.Embedding.from_pretrained(word_embedding,
@@ -264,6 +274,7 @@ class TextEncoder(nn.Module):
 
 
 class TopicEncoder(nn.Module):
+
     def __init__(self):
         super().__init__()
         self.topic_embedding = nn.Embedding(NUM_TOPIC, TOPIC_EMB_DIM)
@@ -280,18 +291,21 @@ class TopicEncoder(nn.Module):
 
 
 class Model(nn.Module):
+
     def __init__(self, word_embedding):
         super().__init__()
         self.city_emb = nn.Embedding(NUM_CITY, CITY_EMB_DIM)
         self.user_id_emb = nn.Embedding(NUM_USER, USER_ID_EMB_DIM)
         self.group_id_emb = nn.Embedding(NUM_GROUP, GROUP_ID_EMB_DIM)
-        prediction_dim = (
-            # user part
-            USER_ID_EMB_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM +
-            # group part
-            GROUP_ID_EMB_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM + DESC_DIM +
-            # event part
-            CITY_EMB_DIM + DESC_DIM)
+        self.user_emb_proj = nn.Sequential(
+            nn.Linear(USER_ID_EMB_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM,
+                      USER_EMB_DIM), nn.ReLU())
+        self.group_emb_proj = nn.Sequential(
+            nn.Linear(
+                GROUP_ID_EMB_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM + DESC_DIM,
+                GROUP_EMB_DIM), nn.ReLU())
+        prediction_dim = (USER_EMB_DIM + GROUP_EMB_DIM + CITY_EMB_DIM +
+                          DESC_DIM)
         self.prediction = nn.Sequential(
             nn.Linear(prediction_dim, prediction_dim // 2), nn.ReLU(),
             nn.Linear(prediction_dim // 2, 1), nn.Sigmoid())
@@ -320,10 +334,10 @@ class Model(nn.Module):
             event_city: batch_size
             event_desc: batch_size, num_words
             user_id: batch_size
-            user_topic: batch_size, num_topics
+            user_topic: batch_size, num_user_topics
             user_city: batch_size
             group_id: batch_size
-            group_topic: batch_size, num_topics
+            group_topic: batch_size, num_group_topics
             group_city: batch_size
             group_desc: batch_size, num_words
             label: batch_size
@@ -337,18 +351,22 @@ class Model(nn.Module):
         batch_group_topic_emb = self.topic_encoder(group_topic)
         batch_group_city_emb = self.city_emb(group_city)
         batch_group_desc_emb = self.text_encoder(group_desc)
-        predict_input = torch.cat([
-            batch_city_emb,
-            batch_desc_emb,
-            batch_user_id_emb,
-            batch_group_id_emb,
-            batch_user_topic_emb,
-            batch_user_city_emb,
-            batch_group_topic_emb,
-            batch_group_city_emb,
-            batch_group_desc_emb,
-        ],
-                                  dim=-1)
+
+        batch_user_emb = self.user_emb_proj(
+            torch.cat(
+                [batch_user_id_emb, batch_user_topic_emb, batch_user_city_emb],
+                dim=-1))
+        batch_group_emb = self.group_emb_proj(
+            torch.cat([
+                batch_group_id_emb, batch_group_topic_emb,
+                batch_group_city_emb, batch_group_desc_emb
+            ],
+                      dim=-1))
+
+        predict_input = torch.cat(
+            [batch_user_emb, batch_group_emb, batch_city_emb, batch_desc_emb],
+            dim=-1)
+
         score = self.prediction(predict_input).squeeze(dim=-1)
         loss = self.loss_fn(score, label)
         return score, loss
@@ -364,8 +382,6 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 # %%
 def run(period_idx, mode):
     assert mode in ('train', 'val', 'test')
-    if period_idx == 0:
-        print('Warning: there are no graphs for period 0')
     dataset = MyDataset(total_behavior[period_idx])
 
     if mode == 'train':
@@ -413,7 +429,8 @@ def run(period_idx, mode):
             total_user_group[period_idx].to(device, non_blocking=True),
             total_user_user[period_idx].to(device, non_blocking=True))
         pred, truth = [], []
-        for step, (event_city, event_desc, user_id, group_id,
+        for step, (event_city, event_desc, user_id, user_topic, user_city,
+                   group_id, group_topic, group_city, group_desc,
                    label) in enumerate(tqdm(dataloader)):
             event_city = event_city.to(device, non_blocking=True)
             event_desc = event_desc.to(device, non_blocking=True)
@@ -436,4 +453,4 @@ def run(period_idx, mode):
 
 
 # %%
-run(1, 'train')
+run(0, 'train')
