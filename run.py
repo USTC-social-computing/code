@@ -33,14 +33,14 @@ TOPIC_EMB_DIM = 50
 USER_ID_EMB_DIM = 50
 GROUP_ID_EMB_DIM = 50
 DESC_DIM = 100
-USER_EMB_DIM = 256
-GROUP_EMB_DIM = 256
 WORD_EMB_DIM = 300
+# The max number of words in descption. None happens if num_word < max.
 NUM_GROUP_DESC = 200
 NUM_EVENT_DESC = 200
 DROP_RATIO = 0.1
 BATCH_SIZE = 32
 LR = 0.01
+DECAY_RATE = 0.6
 
 # %%
 # get word dict and word embedding table
@@ -77,7 +77,7 @@ with open(os.path.join(DATA_PATH, 'user.tsv'), 'r', encoding='utf-8') as f:
 user_dict = {}
 for line in tqdm(user_file):
     idx, topic_list, city = line.strip('\n').split('\t')
-    user_dict[idx] = (eval(topic_list), int(city))
+    user_dict[int(idx)] = (eval(topic_list), int(city))
 
 NUM_USER = len(user_dict)
 print(f'Total user num: {NUM_USER}')
@@ -90,15 +90,15 @@ with open(os.path.join(DATA_PATH, 'group.tsv'), 'r', encoding='utf-8') as f:
 group_dict = {}
 for line in tqdm(group_file):
     idx, topic_list, city, desc = line.strip('\n').split('\t')
-    group_dict[idx] = (eval(topic_list), int(city),
-                       eval(desc)[:NUM_GROUP_DESC])
+    group_dict[int(idx)] = (eval(topic_list), int(city),
+                            eval(desc)[:NUM_GROUP_DESC])
 
 NUM_GROUP = len(group_dict)
 print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-total_time_period = len(os.listdir(os.path.join(DATA_PATH, f'behaviors')))
+total_time_period = len(os.listdir(os.path.join(DATA_PATH, 'behaviors')))
 total_behavior, total_user_group, total_user_user = [], [], []
 
 for idx in range(total_time_period):
@@ -122,36 +122,71 @@ for idx in range(total_time_period):
         user_user_data = json.load(f)
         total_user_user.append(torch.FloatTensor(user_user_data))
 
+print(f'Number of behaviors: {[len(data) for data in total_behavior]}')
+
+# %% [markdown]
+# $r_t$: relation occurred at time t <br>
+# $R_t$: relation used at time t <br>
+# $d$: decay rate
+#
+#
+# $
+# \begin{align}
+# R_0 &= 0 \\
+# R_1 &= r_0 \\
+# \cdots \\
+# R_t &= r_{t-1} + r_{t-2} * d + r_{t-3} * d^2 + ... \\
+#     &= r_{t-1} + d * (r_{t-2} + r_{t-3} * d + ...) \\
+#     &= r_{t-1} + d * R_{t-1}
+# \end{align}
+# $
+#
+# Note the scale of $R$ at different times doesn't matter, because of weights normalization in GNN part
+
+# %%
 total_user_group = [torch.zeros((NUM_USER, NUM_GROUP))] + total_user_group[:-1]
 total_user_user = [torch.zeros((NUM_USER, NUM_USER))] + total_user_user[:-1]
 
-for idx in range(1, total_time_period):
-    total_user_group[idx] += total_user_group[idx - 1]
-    total_user_user[idx] += total_user_user[idx - 1]
-
-print(f'Number of behaviors: {[len(data) for data in total_behavior]}')
+for idx in range(2, total_time_period):
+    total_user_group[idx] += total_user_group[idx - 1] * DECAY_RATE
+    total_user_user[idx] += total_user_user[idx - 1] * DECAY_RATE
 
 
 # %%
 class MyDataset(Dataset):
     def __init__(self, behavior):
         super().__init__()
-        city, desc, user, group, label = [], [], [], [], []
+        (city, desc, user, user_topic, user_city, group, group_topic,
+         group_city, group_desc,
+         label) = [], [], [], [], [], [], [], [], [], []
         for t in behavior:
             city.append(t[0])
             desc.append(t[1])
             user.append(t[2])
+            user_topic.append(user_dict[t[2]][0])
+            user_city.append(user_dict[t[2]][1])
             group.append(t[3])
+            group_topic.append(group_dict[t[3]][0])
+            group_city.append(group_dict[t[3]][1])
+            group_desc.append(group_dict[t[3]][2])
             label.append(t[4])
+
         self.city = np.array(city)
         self.desc = np.array(desc)
         self.user = np.array(user)
+        self.user_topic = np.array(user_topic)
+        self.user_city = np.array(user_city)
         self.group = np.array(group)
+        self.group_topic = np.array(group_topic)
+        self.group_city = np.array(group_city)
+        self.group_desc = np.array(group_desc)
         self.label = np.array(label)
 
     def __getitem__(self, idx):
         return (self.city[idx], self.desc[idx], self.user[idx],
-                self.group[idx], self.label[idx])
+                self.user_topic[idx], self.user_city[idx], self.group[idx],
+                self.group_topic[idx], self.group_city[idx],
+                self.group_desc[idx], self.label[idx])
 
     def __len__(self):
         return len(self.label)
@@ -200,7 +235,7 @@ class TextEncoder(nn.Module):
         self.word_embedding = nn.Embedding.from_pretrained(word_embedding,
                                                            freeze=False)
         self.attn = AttentionPooling(WORD_EMB_DIM, WORD_EMB_DIM // 2)
-        self.dense = nn.Linear(WORD_EMB_DIM // 2, DESC_DIM)
+        self.dense = nn.Linear(WORD_EMB_DIM, DESC_DIM)
         self.dropout = nn.Dropout(p=DROP_RATIO)
 
     def forward(self, text_ids):
@@ -237,12 +272,13 @@ class Model(nn.Module):
         self.city_emb = nn.Embedding(NUM_CITY, CITY_EMB_DIM)
         self.user_id_emb = nn.Embedding(NUM_USER, USER_ID_EMB_DIM)
         self.group_id_emb = nn.Embedding(NUM_GROUP, GROUP_ID_EMB_DIM)
-        self.user_emb_linear = nn.Linear(
-            CITY_EMB_DIM + TOPIC_EMB_DIM + USER_ID_EMB_DIM, USER_EMB_DIM)
-        self.group_emb_linear = nn.Linear(
-            DESC_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM + GROUP_ID_EMB_DIM,
-            GROUP_EMB_DIM)
-        prediction_dim = USER_EMB_DIM + DESC_DIM + GROUP_EMB_DIM
+        prediction_dim = (
+            # user part
+            USER_ID_EMB_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM +
+            # group part
+            GROUP_ID_EMB_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM + DESC_DIM +
+            # event part
+            CITY_EMB_DIM + DESC_DIM)
         self.prediction = nn.Sequential(
             nn.Linear(prediction_dim, prediction_dim // 2), nn.ReLU(),
             nn.Linear(prediction_dim // 2, 1), nn.Sigmoid())
@@ -254,35 +290,59 @@ class Model(nn.Module):
         self.user_group_matrix = user_group_data
         self.user_user_matrix = user_user_data
 
-    def update_graph(self):
-        # TODO: Implement GNN Algorithm
-        user_emb = torch.randn((NUM_USER, USER_EMB_DIM)).to(device)
-        group_emb = torch.randn((NUM_GROUP, GROUP_EMB_DIM)).to(device)
-        return user_emb, group_emb
+    def gnn(self, user_id, group_id):
+        """
+        Use `self.user_group_matrix` and `self.user_user_matrix` as the adjacency matrixs,
+        `self.user_id_emb.weight` and `self.group_id_emb.weight` as the input features to GNN,
+        output features for `user_id` and `group_id`.
+        """
+        # TODO implements GCN
+        # TODO make sure the scale of self.user_group_matrix and self.user_user_matrix not diff too much
+        return self.user_id_emb.weight[user_id], self.group_id_emb.weight[
+            group_id]
 
-    def forward(self, event_city, event_desc, user_id, group_id, label):
+    def forward(self, event_city, event_desc, user_id, user_topic, user_city,
+                group_id, group_topic, group_city, group_desc, label):
         '''
             event_city: batch_size
             event_desc: batch_size, num_words
             user_id: batch_size
+            user_topic: batch_size, num_topics
+            user_city: batch_size
             group_id: batch_size
+            group_topic: batch_size, num_topics
+            group_city: batch_size
+            group_desc: batch_size, num_words
             label: batch_size
         '''
-        user_emb, group_emb = self.update_graph()
+
         batch_city_emb = self.city_emb(event_city)
         batch_desc_emb = self.text_encoder(event_desc)
-        batch_user_emb = torch.index_select(user_emb, dim=0, index=user_id)
-        batch_group_emb = torch.index_select(group_emb, dim=0, index=group_id)
-        predict_input = torch.cat(
-            [batch_user_emb, batch_city_emb, batch_desc_emb, batch_group_emb],
-            dim=-1)
+        batch_user_id_emb, batch_group_id_emb = self.gnn(user_id, group_id)
+        batch_user_topic_emb = self.topic_encoder(user_topic)
+        batch_user_city_emb = self.city_emb(user_city)
+        batch_group_topic_emb = self.topic_encoder(group_topic)
+        batch_group_city_emb = self.city_emb(group_city)
+        batch_group_desc_emb = self.text_encoder(group_desc)
+        predict_input = torch.cat([
+            batch_city_emb,
+            batch_desc_emb,
+            batch_user_id_emb,
+            batch_group_id_emb,
+            batch_user_topic_emb,
+            batch_user_city_emb,
+            batch_group_topic_emb,
+            batch_group_city_emb,
+            batch_group_desc_emb,
+        ],
+                                  dim=-1)
         score = self.prediction(predict_input).squeeze(dim=-1)
         loss = self.loss_fn(score, label)
         return score, loss
 
 
 # %%
-device = torch.device('cuda:0')
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model = Model(word_embedding).to(device)
 print(model)
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
@@ -300,16 +360,23 @@ def run(period_idx, mode):
             total_user_group[period_idx].to(device, non_blocking=True),
             total_user_user[period_idx].to(device, non_blocking=True))
         total_acc, total_loss = 0, 0
-        for step, (event_city, event_desc, user_id, group_id,
+        for step, (event_city, event_desc, user_id, user_topic, user_city,
+                   group_id, group_topic, group_city, group_desc,
                    label) in enumerate(tqdm(dataloader)):
             event_city = event_city.to(device, non_blocking=True)
             event_desc = event_desc.to(device, non_blocking=True)
             user_id = user_id.to(device, non_blocking=True)
+            user_topic = user_topic.to(device, non_blocking=True)
+            user_city = user_city.to(device, non_blocking=True)
             group_id = group_id.to(device, non_blocking=True)
+            group_topic = group_topic.to(device, non_blocking=True)
+            group_city = group_city.to(device, non_blocking=True)
+            group_desc = group_desc.to(device, non_blocking=True)
             label = label.float().to(device, non_blocking=True)
 
-            y_hat, bz_loss = model(event_city, event_desc, user_id, group_id,
-                                   label)
+            y_hat, bz_loss = model(event_city, event_desc, user_id, user_topic,
+                                   user_city, group_id, group_topic,
+                                   group_city, group_desc, label)
             total_acc += acc(label, y_hat)
             total_loss += bz_loss.data.float()
             optimizer.zero_grad()
@@ -334,10 +401,17 @@ def run(period_idx, mode):
             event_city = event_city.to(device, non_blocking=True)
             event_desc = event_desc.to(device, non_blocking=True)
             user_id = user_id.to(device, non_blocking=True)
+            user_topic = user_topic.to(device, non_blocking=True)
+            user_city = user_city.to(device, non_blocking=True)
             group_id = group_id.to(device, non_blocking=True)
+            group_topic = group_topic.to(device, non_blocking=True)
+            group_city = group_city.to(device, non_blocking=True)
+            group_desc = group_desc.to(device, non_blocking=True)
             label = label.to(device, non_blocking=True)
 
-            y_hat, _ = model(event_city, event_desc, user_id, group_id, label)
+            y_hat, _ = model(event_city, event_desc, user_id, user_topic,
+                             user_city, group_id, group_topic, group_city,
+                             group_desc, label)
             pred.extend(y_hat.to('cpu').detach().numpy())
             truth.extent(label.to('cpu').detach().numpy())
 
