@@ -122,8 +122,7 @@ for idx in range(total_time_period):
         user_group_data = torch.sparse_coo_tensor(
             [user_group_data['row'], user_group_data['col']],
             user_group_data['data'], (NUM_USER, NUM_GROUP),
-            dtype=torch.float32).to_dense()
-        # TODO: if `to_dense()` consumes much memory, just use the sparse format
+            dtype=torch.float32)
         total_user_group.append(user_group_data)
     with open(os.path.join(DATA_PATH, f'links/user-user/{idx}.pickle'),
               'rb') as f:
@@ -131,7 +130,7 @@ for idx in range(total_time_period):
         user_user_data = torch.sparse_coo_tensor(
             [user_user_data['row'], user_user_data['col']],
             user_user_data['data'], (NUM_USER, NUM_USER),
-            dtype=torch.float32).to_dense()
+            dtype=torch.float32)
         total_user_user.append(user_user_data)
 
 print(f'Number of behaviors: {[len(data) for data in total_behavior]}')
@@ -156,8 +155,10 @@ print(f'Number of behaviors: {[len(data) for data in total_behavior]}')
 # Note the scale of $R$ at different times doesn't matter, because of weights normalization in GNN part
 
 # %%
-total_user_group = [torch.zeros((NUM_USER, NUM_GROUP))] + total_user_group[:-1]
-total_user_user = [torch.zeros((NUM_USER, NUM_USER))] + total_user_user[:-1]
+total_user_group = [torch.sparse_coo_tensor(size=(NUM_USER, NUM_GROUP))
+                    ] + total_user_group[:-1]
+total_user_user = [torch.sparse_coo_tensor(size=(NUM_USER, NUM_USER))
+                   ] + total_user_user[:-1]
 
 for idx in range(2, total_time_period):
     total_user_group[idx] += total_user_group[idx - 1] * DECAY_RATE
@@ -363,6 +364,8 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 # %%
 def run(period_idx, mode):
     assert mode in ('train', 'val', 'test')
+    if period_idx == 0:
+        print('Warning: there are no graphs for period 0')
     dataset = MyDataset(total_behavior[period_idx])
 
     if mode == 'train':
@@ -433,4 +436,4 @@ def run(period_idx, mode):
 
 
 # %%
-run(0, 'train')
+run(1, 'train')
