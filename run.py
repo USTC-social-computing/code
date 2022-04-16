@@ -172,7 +172,6 @@ for idx in range(1, total_time_period):
 
 # %%
 class MyDataset(Dataset):
-
     def __init__(self, behavior):
         super().__init__()
         (city, desc, user, user_topic, user_city, group, group_topic,
@@ -222,7 +221,6 @@ def acc(y_true, y_hat):
 # %%
 # define model
 class AttentionPooling(nn.Module):
-
     def __init__(self, emb_size, hidden_size):
         super().__init__()
         self.att_fc1 = nn.Linear(emb_size, hidden_size)
@@ -250,7 +248,6 @@ class AttentionPooling(nn.Module):
 
 
 class TextEncoder(nn.Module):
-
     def __init__(self, word_embedding):
         super().__init__()
         self.word_embedding = nn.Embedding.from_pretrained(word_embedding,
@@ -272,7 +269,6 @@ class TextEncoder(nn.Module):
 
 
 class TopicEncoder(nn.Module):
-
     def __init__(self):
         super().__init__()
         self.topic_embedding = nn.Embedding(NUM_TOPIC, TOPIC_EMB_DIM)
@@ -289,7 +285,6 @@ class TopicEncoder(nn.Module):
 
 
 class Model(nn.Module):
-
     def __init__(self, word_embedding):
         super().__init__()
         self.city_emb = nn.Embedding(NUM_CITY, CITY_EMB_DIM)
