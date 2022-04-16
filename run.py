@@ -16,9 +16,9 @@
 from tqdm.auto import tqdm
 import os
 import numpy as np
-import json
 import torch
 import torch.nn as nn
+import pickle
 from torch.utils.data import Dataset, DataLoader
 
 # %%
@@ -54,15 +54,18 @@ for line in tqdm(word_file):
 
 word_embedding = np.zeros(shape=(len(word_dict) + 1, WORD_EMB_DIM))
 have_word = 0
-with open(GLOVE_PATH, 'rb') as f:
-    for line in tqdm(f):
-        line = line.split()
-        word = line[0].decode()
-        if word in word_dict:
-            idx = word_dict[word]
-            tp = [float(x) for x in line[1:]]
-            word_embedding[idx] = np.array(tp)
-            have_word += 1
+try:
+    with open(GLOVE_PATH, 'rb') as f:
+        for line in tqdm(f):
+            line = line.split()
+            word = line[0].decode()
+            if word in word_dict:
+                idx = word_dict[word]
+                tp = [float(x) for x in line[1:]]
+                word_embedding[idx] = np.array(tp)
+                have_word += 1
+except FileNotFoundError:
+    print('Warning: Glove file not found.')
 word_embedding = torch.from_numpy(word_embedding).float()
 
 print(f'Word dict length: {len(word_dict)}')
@@ -113,14 +116,23 @@ for idx in range(total_time_period):
             (int(city), eval(desc)[:NUM_EVENT_DESC], int(user), int(group),
              int(label)))
     total_behavior.append(behavior_data)
-    with open(os.path.join(DATA_PATH, f'links/user-group/{idx}.json'),
-              'r') as f:
-        user_group_data = json.load(f)
-        total_user_group.append(torch.FloatTensor(user_group_data))
-    with open(os.path.join(DATA_PATH, f'links/user-user/{idx}.json'),
-              'r') as f:
-        user_user_data = json.load(f)
-        total_user_user.append(torch.FloatTensor(user_user_data))
+    with open(os.path.join(DATA_PATH, f'links/user-group/{idx}.pickle'),
+              'rb') as f:
+        user_group_data = pickle.load(f)
+        user_group_data = torch.sparse_coo_tensor(
+            [user_group_data['row'], user_group_data['col']],
+            user_group_data['data'], (NUM_USER, NUM_GROUP),
+            dtype=torch.float32).to_dense()
+        # TODO: if `to_dense()` consumes much memory, just use the sparse format
+        total_user_group.append(user_group_data)
+    with open(os.path.join(DATA_PATH, f'links/user-user/{idx}.pickle'),
+              'rb') as f:
+        user_user_data = pickle.load(f)
+        user_user_data = torch.sparse_coo_tensor(
+            [user_user_data['row'], user_user_data['col']],
+            user_user_data['data'], (NUM_USER, NUM_USER),
+            dtype=torch.float32).to_dense()
+        total_user_user.append(user_user_data)
 
 print(f'Number of behaviors: {[len(data) for data in total_behavior]}')
 
@@ -385,9 +397,11 @@ def run(period_idx, mode):
 
             if step % 10 == 0:
                 print(f'Loss: {total_loss / step}, Acc: {total_acc / step}')
-
-        ckpt_path = os.path.join(MODEL_DIR, f'{period_idx}.pt')
-        torch.save(model.state_dict(), ckpt_path)
+        try:
+            ckpt_path = os.path.join(MODEL_DIR, f'{period_idx}.pt')
+            torch.save(model.state_dict(), ckpt_path)
+        except FileNotFoundError:
+            print('Warning: model dir not found, skip saving model')
     else:
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
         model.eval()
