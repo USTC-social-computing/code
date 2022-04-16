@@ -77,9 +77,8 @@ with open(os.path.join(DATA_PATH, 'user.tsv'), 'r', encoding='utf-8') as f:
 
 user_dict = {}
 for line in tqdm(user_file):
-    idx, topic_list, city = line.strip('\n').split('\t')
-    topic_list = [int(x) for x in topic_list.split(' ')]
-    user_dict[int(idx)] = (topic_list, int(city))
+    idx, city, topic_list = line.strip('\n').split('\t')
+    user_dict[int(idx)] = (eval(topic_list), int(city))
 
 NUM_USER = len(user_dict)
 print(f'Total user num: {NUM_USER}')
@@ -91,10 +90,9 @@ with open(os.path.join(DATA_PATH, 'group.tsv'), 'r', encoding='utf-8') as f:
 
 group_dict = {}
 for line in tqdm(group_file):
-    idx, topic_list, city, desc = line.strip('\n').split('\t')
-    topic_list = [int(x) for x in topic_list.split(' ')]
-    desc = [int(x) for x in desc.split(' ')]
-    group_dict[int(idx)] = (topic_list, int(city), desc[:NUM_GROUP_DESC])
+    idx, city, topic_list, desc = line.strip('\n').split('\t')
+    group_dict[int(idx)] = (eval(topic_list), int(city),
+                            eval(desc)[:NUM_GROUP_DESC])
 
 NUM_GROUP = len(group_dict)
 print(f'Total group num: {NUM_GROUP}')
@@ -118,10 +116,10 @@ for behavior_file, user_group_file, user_user_file in \
               encoding='utf-8') as f:
         behavior_file = f.readlines()[1:]
     for line in tqdm(behavior_file):
-        city, desc, user, group, label = line.strip('\n').split('\t')
-        desc = [int(x) for x in desc.split(' ')]
-        behavior_data.append((int(city), desc[:NUM_EVENT_DESC], int(user),
-                              int(group), int(label)))
+        group, city, desc, user, label = line.strip('\n').split('\t')
+        behavior_data.append(
+            (int(city), eval(desc)[:NUM_EVENT_DESC], int(user), int(group),
+             int(label)))
     total_behavior.append(behavior_data)
     with open(os.path.join(DATA_PATH, f'links/user-group/{user_group_file}'),
               'rb') as f:
