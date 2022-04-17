@@ -109,7 +109,7 @@ print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-total_behavior_file = sorted(os.listdir(os.path.join(DATA_PATH, 'behaviors')))
+total_behavior_file = sorted(os.listdir(os.path.join(DATA_PATH, 'behaviours')))
 total_user_group_file = sorted(
     os.listdir(os.path.join(DATA_PATH, 'links/user-group')))
 total_user_user_file = sorted(
@@ -118,14 +118,15 @@ total_user_user_file = sorted(
 total_time_period = len(total_behavior_file)
 total_behavior, total_user_group, total_user_user = [], [], []
 
-for behavior_file, user_group_file, user_user_file in \
-        zip(total_behavior_file, total_user_group_file, total_user_user_file):
+for behavior_file, user_group_file, user_user_file in tqdm(
+        zip(total_behavior_file, total_user_group_file, total_user_user_file),
+        total=total_time_period):
     behavior_data = []
-    with open(os.path.join(DATA_PATH, f'behaviors/{behavior_file}'),
+    with open(os.path.join(DATA_PATH, f'behaviours/{behavior_file}'),
               'r',
               encoding='utf-8') as f:
         behavior_file = f.readlines()[1:]
-    for line in tqdm(behavior_file):
+    for line in behavior_file:
         _, group, city, desc, user, label = line.strip('\n').split('\t')
         behavior_data.append(
             (int(city), eval(desc)[:NUM_EVENT_DESC], int(user), int(group),
@@ -319,14 +320,14 @@ class TopicEncoder(nn.Module):
 class GCN(nn.Module):
     def __init__(self, feature_dim, num_layers):
         super(GCN, self).__init__()
-        self.layers = nn.ModuleList(
-            [GraphConv(feature_dim, feature_dim) for _ in range(num_layers)])
+        self.layers = nn.ModuleList([
+            GraphConv(feature_dim, feature_dim, activation=F.relu)
+            for _ in range(num_layers)
+        ])
 
     def forward(self, g, h):
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             h = layer(g, h, edge_weight=g.edata['weight'])
-            if i != len(self.layers) - 1:
-                h = F.relu(h)
         return h
 
 
@@ -478,8 +479,9 @@ def run(period_idx, mode):
             bz_loss.backward()
             optimizer.step()
 
-            if step % 10 == 0:
-                print(f'Loss: {total_loss / step}, Acc: {total_acc / step}')
+            if (step + 1) % 100 == 0:
+                print(f'Loss: {total_loss / 100}, Acc: {total_acc / 100}')
+                total_loss, total_acc = 0, 0
         try:
             ckpt_path = os.path.join(MODEL_DIR, f'{period_idx}.pt')
             torch.save(model.state_dict(), ckpt_path)
