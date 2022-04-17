@@ -506,13 +506,13 @@ def run(period_idx, mode):
             group_topic = group_topic.to(device, non_blocking=True)
             group_city = group_city.to(device, non_blocking=True)
             group_desc = group_desc.to(device, non_blocking=True)
-            label = label.to(device, non_blocking=True)
+            label = label.float().to(device, non_blocking=True)
 
             y_hat, _ = model(event_city, event_desc, user_id, user_topic,
                              user_city, group_id, group_topic, group_city,
                              group_desc, label)
             pred.extend(y_hat.to('cpu').detach().numpy())
-            truth.extent(label.to('cpu').detach().numpy())
+            truth.extend(label.to('cpu').detach().numpy())
 
         calculate_metrics(pred, truth)
 
