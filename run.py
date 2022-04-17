@@ -20,10 +20,11 @@ import torch
 import torch.nn as nn
 import pickle
 from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import precision_score, recall_score
 
 # %%
 # config
-DATA_PATH = "./example_data"
+DATA_PATH = "./data"
 GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
 MODEL_DIR = "../../model_all"
 NUM_CITY = 2675
@@ -103,7 +104,7 @@ print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-total_behavior_file = sorted(os.listdir(os.path.join(DATA_PATH, 'behaviors')))
+total_behavior_file = sorted(os.listdir(os.path.join(DATA_PATH, 'behaviours')))
 total_user_group_file = sorted(
     os.listdir(os.path.join(DATA_PATH, 'links/user-group')))
 total_user_user_file = sorted(
@@ -115,7 +116,7 @@ total_behavior, total_user_group, total_user_user = [], [], []
 for behavior_file, user_group_file, user_user_file in \
         zip(total_behavior_file, total_user_group_file, total_user_user_file):
     behavior_data = []
-    with open(os.path.join(DATA_PATH, f'behaviors/{behavior_file}'),
+    with open(os.path.join(DATA_PATH, f'behaviours/{behavior_file}'),
               'r',
               encoding='utf-8') as f:
         behavior_file = f.readlines()[1:]
@@ -377,6 +378,14 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
 
 # %%
+def calculate_metrics(pred, truth):
+    y_pred = pred >= 0.5
+    precision = precision_score(truth, y_pred)
+    recall = recall_score(truth, y_pred)
+    print(f'Precision: {precision:.4f}  Recall: {recall:.4f}')
+
+
+# %%
 def run(period_idx, mode):
     assert mode in ('train', 'val', 'test')
     dataset = MyDataset(total_behavior[period_idx])
@@ -446,7 +455,7 @@ def run(period_idx, mode):
             pred.extend(y_hat.to('cpu').detach().numpy())
             truth.extent(label.to('cpu').detach().numpy())
 
-        print(f'Acc: {acc(truth, pred)}')
+        calculate_metrics(pred, truth)
 
 
 # %%
