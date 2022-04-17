@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import pickle
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import precision_score, recall_score
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
 
 # %%
 # config
@@ -28,21 +28,21 @@ DATA_PATH = "./data"
 GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
 MODEL_DIR = "../../model_all"
 NUM_CITY = 2675
-NUM_TOPIC = 18114
-CITY_EMB_DIM = 50
-TOPIC_EMB_DIM = 50
-USER_ID_EMB_DIM = 50
-GROUP_ID_EMB_DIM = 50
-DESC_DIM = 100
+NUM_TOPIC = 18115
+CITY_EMB_DIM = 64
+TOPIC_EMB_DIM = 64
+USER_ID_EMB_DIM = 64
+GROUP_ID_EMB_DIM = 64
+DESC_DIM = 128
 USER_EMB_DIM = 256
 GROUP_EMB_DIM = 256
 WORD_EMB_DIM = 300
 # The max number of words in descption. None happens if num_word < max.
 NUM_GROUP_DESC = 190
 NUM_EVENT_DESC = 280
-DROP_RATIO = 0.1
+DROP_RATIO = 0.2
 BATCH_SIZE = 32
-LR = 0.01
+LR = 0.005
 DECAY_RATE = 0.6
 
 # %%
@@ -216,14 +216,6 @@ class MyDataset(Dataset):
 
 
 # %%
-def acc(y_true, y_hat):
-    y_hat = (y_hat >= 0.5).float()
-    tot = y_true.shape[0]
-    hit = torch.sum(y_true == y_hat)
-    return hit.data.float() * 1.0 / tot
-
-
-# %%
 # define model
 class AttentionPooling(nn.Module):
     def __init__(self, emb_size, hidden_size):
@@ -378,16 +370,31 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
 
 # %%
+def acc(y_true, y_hat):
+    y_hat = (y_hat >= 0.5).float()
+    tot = y_true.shape[0]
+    hit = torch.sum(y_true == y_hat)
+    return hit.data.float() * 1.0 / tot
+
+
+# %%
 def calculate_metrics(pred, truth):
+    pred = np.array(pred)
+    truth = np.array(truth)
     y_pred = pred >= 0.5
     precision = precision_score(truth, y_pred)
     recall = recall_score(truth, y_pred)
-    print(f'Precision: {precision:.4f}  Recall: {recall:.4f}')
+    f1 = f1_score(truth, y_pred)
+    auc = roc_auc_score(truth, pred)
+    print(
+        f'Precision: {precision:.4f}\tRecall: {recall:.4f}\tF1: {f1:.4f}\tAUC: {auc:.4f}'
+    )
+    return precision, recall, f1, auc
 
 
 # %%
 def run(period_idx, mode):
-    assert mode in ('train', 'val', 'test')
+    assert mode in ('train', 'test')
     dataset = MyDataset(total_behavior[period_idx])
 
     if mode == 'train':
