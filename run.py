@@ -19,6 +19,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import pickle
+import dgl
+from dgl.nn.pytorch import GraphConv
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
 
@@ -44,6 +47,8 @@ DROP_RATIO = 0.2
 BATCH_SIZE = 32
 LR = 0.005
 DECAY_RATE = 0.6
+WEIGHT_SMOOTHING_EXPONENT = 0.5
+NUM_GCN_LAYER = 2  # set to 0 to skip GCN
 
 # %%
 # get word dict and word embedding table
@@ -104,7 +109,7 @@ print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-total_behavior_file = sorted(os.listdir(os.path.join(DATA_PATH, 'behaviours')))
+total_behavior_file = sorted(os.listdir(os.path.join(DATA_PATH, 'behaviors')))
 total_user_group_file = sorted(
     os.listdir(os.path.join(DATA_PATH, 'links/user-group')))
 total_user_user_file = sorted(
@@ -116,7 +121,7 @@ total_behavior, total_user_group, total_user_user = [], [], []
 for behavior_file, user_group_file, user_user_file in \
         zip(total_behavior_file, total_user_group_file, total_user_user_file):
     behavior_data = []
-    with open(os.path.join(DATA_PATH, f'behaviours/{behavior_file}'),
+    with open(os.path.join(DATA_PATH, f'behaviors/{behavior_file}'),
               'r',
               encoding='utf-8') as f:
         behavior_file = f.readlines()[1:]
@@ -165,14 +170,44 @@ print(f'Number of behaviors: {[len(data) for data in total_behavior]}')
 # Note the scale of $R$ at different times doesn't matter, because of weights normalization in GNN part
 
 # %%
-total_user_group = [torch.sparse_coo_tensor(size=(NUM_USER, NUM_GROUP))
-                    ] + total_user_group[:-1]
-total_user_user = [torch.sparse_coo_tensor(size=(NUM_USER, NUM_USER))
-                   ] + total_user_user[:-1]
-
-for idx in range(1, total_time_period):
-    total_user_group[idx] += total_user_group[idx - 1] * DECAY_RATE
-    total_user_user[idx] += total_user_user[idx - 1] * DECAY_RATE
+total_graph = [
+    torch.sparse_coo_tensor(size=(NUM_USER + NUM_GROUP, NUM_USER + NUM_GROUP))
+]
+for user_user, user_group in zip(total_user_user[:-1], total_user_group[:-1]):
+    # combine the two graphs
+    # TODO make sure the scale of user_user and user_group not diff too much
+    user_user_indices = user_user._indices()
+    user_user_values = user_user._values()
+    user_group_indices = user_group._indices()
+    user_group_values = user_group._values()
+    user_group_indices[1] += NUM_USER
+    user_user_self_loop_value = user_user_values.median()
+    user_group_self_loop_value = user_group_values.median()
+    current_grpah_indices = torch.cat(
+        (
+            user_user_indices,  # top left U-U
+            user_group_indices,  # top right U-G
+            user_group_indices[[1, 0]],  # bottom left G-U
+            torch.arange(0, NUM_USER).expand(2, -1),  # U-U self loop
+            torch.arange(NUM_USER, NUM_USER + NUM_GROUP).expand(
+                2, -1),  # G-G self loop
+        ),
+        dim=1)
+    current_graph_values = torch.cat(
+        (
+            user_user_values,  # top left U-U
+            user_group_values,  # top right U-G
+            user_group_values,  # bottom left G-U
+            user_user_self_loop_value.expand(NUM_USER),  # U-U self loop
+            user_group_self_loop_value.expand(NUM_GROUP),  # G-G self loop
+        ),
+        dim=0)
+    current_graph = torch.sparse_coo_tensor(current_grpah_indices,
+                                            current_graph_values,
+                                            size=(NUM_USER + NUM_GROUP,
+                                                  NUM_USER + NUM_GROUP))
+    current_graph = torch.pow(current_graph, WEIGHT_SMOOTHING_EXPONENT)
+    total_graph.append(current_graph + total_graph[-1] * DECAY_RATE)
 
 
 # %%
@@ -281,6 +316,20 @@ class TopicEncoder(nn.Module):
         return topic_vec
 
 
+class GCN(nn.Module):
+    def __init__(self, feature_dim, num_layers):
+        super(GCN, self).__init__()
+        self.layers = nn.ModuleList(
+            [GraphConv(feature_dim, feature_dim) for _ in range(num_layers)])
+
+    def forward(self, g, h):
+        for i, layer in enumerate(self.layers):
+            h = layer(g, h, edge_weight=g.edata['weight'])
+            if i != len(self.layers) - 1:
+                h = F.relu(h)
+        return h
+
+
 class Model(nn.Module):
     def __init__(self, word_embedding):
         super().__init__()
@@ -301,22 +350,25 @@ class Model(nn.Module):
             nn.Linear(prediction_dim // 2, 1), nn.Sigmoid())
         self.text_encoder = TextEncoder(word_embedding)
         self.topic_encoder = TopicEncoder()
+        assert USER_ID_EMB_DIM == GROUP_ID_EMB_DIM
+        self.gcn_encoder = GCN(USER_ID_EMB_DIM, NUM_GCN_LAYER)
         self.loss_fn = nn.BCELoss()
 
-    def update_edge_weight(self, user_group_data, user_user_data):
-        self.user_group_matrix = user_group_data
-        self.user_user_matrix = user_user_data
+    def build_graph(self, graph_data):
+        self.graph = dgl.graph(tuple([*graph_data.indices()]),
+                               num_nodes=NUM_USER + NUM_GROUP)
+        self.graph.edata['weight'] = graph_data.values()
 
-    def gnn(self, user_id, group_id):
+    def gcn(self, user_id, group_id):
         """
-        Use `self.user_group_matrix` and `self.user_user_matrix` as the adjacency matrixs,
-        `self.user_id_emb.weight` and `self.group_id_emb.weight` as the input features to GNN,
+        Use `self.graph` as the graph,
+        `self.user_id_emb.weight` and `self.group_id_emb.weight` as the input features to GCN,
         output features for `user_id` and `group_id`.
         """
-        # TODO implements GCN
-        # TODO make sure the scale of self.user_group_matrix and self.user_user_matrix not diff too much
-        return self.user_id_emb.weight[user_id], self.group_id_emb.weight[
-            group_id]
+        features = torch.cat(
+            (self.user_id_emb.weight, self.group_id_emb.weight), dim=0)
+        features = self.gcn_encoder(self.graph, features)
+        return features[user_id], features[group_id + NUM_USER]
 
     def forward(self, event_city, event_desc, user_id, user_topic, user_city,
                 group_id, group_topic, group_city, group_desc, label):
@@ -335,7 +387,7 @@ class Model(nn.Module):
 
         batch_city_emb = self.city_emb(event_city)
         batch_desc_emb = self.text_encoder(event_desc)
-        batch_user_id_emb, batch_group_id_emb = self.gnn(user_id, group_id)
+        batch_user_id_emb, batch_group_id_emb = self.gcn(user_id, group_id)
         batch_user_topic_emb = self.topic_encoder(user_topic)
         batch_user_city_emb = self.city_emb(user_city)
         batch_group_topic_emb = self.topic_encoder(group_topic)
@@ -400,9 +452,8 @@ def run(period_idx, mode):
     if mode == 'train':
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
         model.train()
-        model.update_edge_weight(
-            total_user_group[period_idx].to(device, non_blocking=True),
-            total_user_user[period_idx].to(device, non_blocking=True))
+        model.build_graph(total_graph[period_idx].to(device,
+                                                     non_blocking=True))
         total_acc, total_loss = 0, 0
         for step, (event_city, event_desc, user_id, user_topic, user_city,
                    group_id, group_topic, group_city, group_desc,
@@ -438,9 +489,8 @@ def run(period_idx, mode):
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
         model.eval()
         torch.set_grad_enabled(False)
-        model.update_edge_weight(
-            total_user_group[period_idx].to(device, non_blocking=True),
-            total_user_user[period_idx].to(device, non_blocking=True))
+        model.build_graph(total_graph[period_idx].to(device,
+                                                     non_blocking=True))
         pred, truth = [], []
         for step, (event_city, event_desc, user_id, user_topic, user_city,
                    group_id, group_topic, group_city, group_desc,
@@ -466,4 +516,4 @@ def run(period_idx, mode):
 
 
 # %%
-run(0, 'train')
+run(1, 'train')
