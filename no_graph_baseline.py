@@ -50,8 +50,8 @@ class Args():
         self.DROP_RATIO = 0.2
         self.BATCH_SIZE = 32
         self.LR = 0.005
-        self.SAVE_STEP = 2000
-        self.EPOCH = 3
+        self.SAVE_STEP = 1000
+        self.EPOCH = 1
 
 
 args = Args()
