@@ -127,7 +127,7 @@ print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-TRAIN_NUM, VAL_NUM = 93, 5
+TRAIN_NUM = 97
 
 total_behavior_file = sorted(
     os.listdir(os.path.join(args.DATA_PATH, 'behaviours')))
@@ -137,7 +137,7 @@ total_user_user_file = sorted(
     os.listdir(os.path.join(args.DATA_PATH, 'links/user-user')))
 
 total_time_period = len(total_behavior_file)
-train_behavior, val_behavior, test_behavior = [], [], []
+train_behavior, test_behavior = [], []
 total_user_group, total_user_user = [], []
 
 for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
@@ -157,8 +157,6 @@ for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
         random.seed(42)
         random.shuffle(behavior_data)
         train_behavior.append(behavior_data)
-    elif idx < TRAIN_NUM + VAL_NUM:
-        val_behavior.extend(behavior_data)
     else:
         test_behavior.extend(behavior_data)
 
@@ -182,10 +180,9 @@ for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
             dtype=torch.float32)
         total_user_user.append(user_user_data)
 
-print(f'Number of training behaviors: {[len(x) for x in train_behavior]}, \
-{[math.ceil(len(x) // args.BATCH_SIZE) for x in train_behavior]} steps')
-print(f'Number of validation behaviors: {len(val_behavior)}, \
-{math.ceil(len(val_behavior) // args.BATCH_SIZE)} steps')
+train_behavior_num = sum([len(x) for x in train_behavior])
+print(f'Number of training behaviors: {train_behavior_num}, \
+{math.ceil(train_behavior_num // args.BATCH_SIZE)} steps')
 print(f'Number of testing behaviors: {len(test_behavior)}, \
 {math.ceil(len(test_behavior) // args.BATCH_SIZE)} steps')
 
