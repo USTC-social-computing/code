@@ -43,8 +43,7 @@ class Args():
         self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
         self.ENABLE_CACHE = True
         self.CACHE_DIR = "./cache"
-        self.TRAIN_NUM = 93
-        self.VAL_NUM = 5
+        self.TRAIN_NUM = 97
         self.NUM_CITY = 2675
         self.NUM_TOPIC = 18115
         self.CITY_EMB_DIM = 64
@@ -210,7 +209,7 @@ def generate_behavior_and_graph():
         os.listdir(os.path.join(args.DATA_PATH, 'links/user-user')))
 
     total_time_period = len(total_behavior_file)
-    train_behavior, val_behavior, test_behavior = [], [], []
+    train_behavior, test_behavior = [], []
     total_user_group, total_user_user = [], []
 
     for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
@@ -230,8 +229,6 @@ def generate_behavior_and_graph():
             random.seed(42)
             random.shuffle(behavior_data)
             train_behavior.append(behavior_data)
-        elif idx < args.TRAIN_NUM + args.VAL_NUM:
-            val_behavior.extend(behavior_data)
         else:
             test_behavior.extend(behavior_data)
 
@@ -256,10 +253,9 @@ def generate_behavior_and_graph():
                 dtype=torch.float32)
             total_user_user.append(user_user_data)
 
-    print(f'Number of training behaviors: {[len(x) for x in train_behavior]}, \
-    {[math.ceil(len(x) // args.BATCH_SIZE) for x in train_behavior]} steps')
-    print(f'Number of validation behaviors: {len(val_behavior)}, \
-    {math.ceil(len(val_behavior) // args.BATCH_SIZE)} steps')
+    train_behavior_num = sum([len(x) for x in train_behavior])
+    print(f'Number of training behaviors: {train_behavior_num}, \
+    {math.ceil(train_behavior_num // args.BATCH_SIZE)} steps')
     print(f'Number of testing behaviors: {len(test_behavior)}, \
     {math.ceil(len(test_behavior) // args.BATCH_SIZE)} steps')
 
@@ -310,18 +306,18 @@ def generate_behavior_and_graph():
         total_graph.append(current_graph + total_graph[-1] * args.DECAY_RATE)
 
     train_graph = total_graph[:args.TRAIN_NUM]
-    val_test_graph = total_graph[args.TRAIN_NUM]
+    test_graph = total_graph[args.TRAIN_NUM]
 
-    return train_behavior, val_behavior, test_behavior, train_graph, val_test_graph
+    return train_behavior, test_behavior, train_graph, test_graph
 
 
-train_behavior, val_behavior, test_behavior, train_graph, val_test_graph = load_from_cache(
+train_behavior, test_behavior, train_graph, test_graph = load_from_cache(
     [], generate_behavior_and_graph, args.CACHE_DIR, args.ENABLE_CACHE)
 
 # Loading a sparse tensor from pickle seems to be always uncoalesced...
 for i in range(len(train_graph)):
     train_graph[i] = train_graph[i].coalesce()
-val_test_graph = val_test_graph.coalesce()
+test_graph = test_graph.coalesce()
 
 
 # %%
@@ -653,7 +649,7 @@ def run(mode):
             print(f'[{idx + 1}/{total_ckpt_num}] Testing {ckpt}')
             checkpoint = torch.load(os.path.join(args.MODEL_DIR, ckpt))
             model.load_state_dict(checkpoint)
-            model.build_graph(val_test_graph.to(device, non_blocking=True))
+            model.build_graph(test_graph.to(device, non_blocking=True))
 
             pred, truth = [], []
             for (event_city, event_desc, user_id, user_topic, user_city,
