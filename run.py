@@ -19,40 +19,56 @@ import numpy as np
 import torch
 import torch.nn as nn
 import pickle
+import random
+import math
+import fnmatch
+import wandb
 import dgl
 from dgl.nn.pytorch import GraphConv
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
 
+
 # %%
 # config
-DATA_PATH = "./data"
-GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
-MODEL_DIR = "../../model_all"
-NUM_CITY = 2675
-NUM_TOPIC = 18115
-CITY_EMB_DIM = 64
-TOPIC_EMB_DIM = 64
-USER_ID_EMB_DIM = 64
-GROUP_ID_EMB_DIM = 64
-DESC_DIM = 128
-USER_EMB_DIM = 256
-GROUP_EMB_DIM = 256
-WORD_EMB_DIM = 300
-# The max number of words in descption. None happens if num_word < max.
-NUM_GROUP_DESC = 190
-NUM_EVENT_DESC = 280
-DROP_RATIO = 0.2
-BATCH_SIZE = 32
-LR = 0.005
-DECAY_RATE = 0.6
-WEIGHT_SMOOTHING_EXPONENT = 0.5
-NUM_GCN_LAYER = 2  # set to 0 to skip GCN
+class Args():
+    def __init__(self):
+        self.USE_WANDB = True
+        self.EXP_NAME = "no-graph-time-period"
+        self.DATA_PATH = "./data"
+        self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
+        self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
+        self.NUM_CITY = 2675
+        self.NUM_TOPIC = 18115
+        self.CITY_EMB_DIM = 64
+        self.TOPIC_EMB_DIM = 64
+        self.USER_ID_EMB_DIM = 64
+        self.GROUP_ID_EMB_DIM = 64
+        self.DESC_DIM = 128
+        self.USER_EMB_DIM = 256
+        self.GROUP_EMB_DIM = 256
+        self.WORD_EMB_DIM = 300
+        # The max number of words in descption. None happens if num_word < max.
+        self.NUM_GROUP_DESC = 190
+        self.NUM_EVENT_DESC = 280
+        self.DROP_RATIO = 0.2
+        self.BATCH_SIZE = 32
+        self.LR = 0.005
+        self.SAVE_STEP = 1000
+        self.EPOCH = 1
+        self.DECAY_RATE = 0.6
+        self.WEIGHT_SMOOTHING_EXPONENT = 0.5
+        self.NUM_GCN_LAYER = 0  # set to 0 to skip GCN
+
+
+args = Args()
+os.makedirs(args.MODEL_DIR, exist_ok=True)
 
 # %%
 # get word dict and word embedding table
-with open(os.path.join(DATA_PATH, 'word.tsv'), 'r', encoding='utf-8') as f:
+with open(os.path.join(args.DATA_PATH, 'word.tsv'), 'r',
+          encoding='utf-8') as f:
     word_file = f.readlines()[1:]
 
 word_dict = {}
@@ -60,10 +76,10 @@ for line in tqdm(word_file):
     idx, word = line.strip('\n').split('\t')
     word_dict[word] = int(idx)
 
-word_embedding = np.random.uniform(size=(len(word_dict), WORD_EMB_DIM))
+word_embedding = np.random.uniform(size=(len(word_dict), args.WORD_EMB_DIM))
 have_word = 0
 try:
-    with open(GLOVE_PATH, 'rb') as f:
+    with open(args.GLOVE_PATH, 'rb') as f:
         for line in tqdm(f):
             line = line.split()
             word = line[0].decode()
@@ -82,7 +98,8 @@ print(f'Missing rate: {(len(word_dict) - have_word) / len(word_dict)}')
 
 # %%
 # get user dict
-with open(os.path.join(DATA_PATH, 'user.tsv'), 'r', encoding='utf-8') as f:
+with open(os.path.join(args.DATA_PATH, 'user.tsv'), 'r',
+          encoding='utf-8') as f:
     user_file = f.readlines()[1:]
 
 user_dict = {}
@@ -95,53 +112,69 @@ print(f'Total user num: {NUM_USER}')
 
 # %%
 # get group dict
-with open(os.path.join(DATA_PATH, 'group.tsv'), 'r', encoding='utf-8') as f:
+with open(os.path.join(args.DATA_PATH, 'group.tsv'), 'r',
+          encoding='utf-8') as f:
     group_file = f.readlines()[1:]
 
 group_dict = {}
 for line in tqdm(group_file):
     idx, city, topic_list, desc = line.strip('\n').split('\t')
     group_dict[int(idx)] = (eval(topic_list), int(city),
-                            eval(desc)[:NUM_GROUP_DESC])
+                            eval(desc)[:args.NUM_GROUP_DESC])
 
 NUM_GROUP = len(group_dict)
 print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-total_behavior_file = sorted(os.listdir(os.path.join(DATA_PATH, 'behaviours')))
+TRAIN_NUM, VAL_NUM = 93, 5
+
+total_behavior_file = sorted(
+    os.listdir(os.path.join(args.DATA_PATH, 'behaviours')))
 total_user_group_file = sorted(
-    os.listdir(os.path.join(DATA_PATH, 'links/user-group')))
+    os.listdir(os.path.join(args.DATA_PATH, 'links/user-group')))
 total_user_user_file = sorted(
-    os.listdir(os.path.join(DATA_PATH, 'links/user-user')))
+    os.listdir(os.path.join(args.DATA_PATH, 'links/user-user')))
 
 total_time_period = len(total_behavior_file)
-total_behavior, total_user_group, total_user_user = [], [], []
+train_behavior, val_behavior, test_behavior = [], [], []
+total_user_group, total_user_user = [], []
 
-for behavior_file, user_group_file, user_user_file in tqdm(
-        zip(total_behavior_file, total_user_group_file, total_user_user_file),
-        total=total_time_period):
+for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
+        tqdm(zip(total_behavior_file, total_user_group_file,
+                 total_user_user_file),
+             total=total_time_period)):
     behavior_data = []
-    with open(os.path.join(DATA_PATH, f'behaviours/{behavior_file}'),
+    with open(os.path.join(args.DATA_PATH, f'behaviours/{behavior_file}'),
               'r',
               encoding='utf-8') as f:
         behavior_file = f.readlines()[1:]
     for line in behavior_file:
         _, group, city, desc, user, label = line.strip('\n').split('\t')
-        behavior_data.append(
-            (int(city), eval(desc)[:NUM_EVENT_DESC], int(user), int(group),
-             int(label)))
-    total_behavior.append(behavior_data)
-    with open(os.path.join(DATA_PATH, f'links/user-group/{user_group_file}'),
-              'rb') as f:
+        behavior_data.append((int(city), eval(desc)[:args.NUM_EVENT_DESC],
+                              int(user), int(group), int(label)))
+    if idx < TRAIN_NUM:
+        random.seed(42)
+        random.shuffle(behavior_data)
+        train_behavior.append(behavior_data)
+    elif idx < TRAIN_NUM + VAL_NUM:
+        val_behavior.extend(behavior_data)
+    else:
+        test_behavior.extend(behavior_data)
+
+    with open(
+            os.path.join(args.DATA_PATH,
+                         f'links/user-group/{user_group_file}'), 'rb') as f:
         user_group_data = pickle.load(f)
         user_group_data = torch.sparse_coo_tensor(
             [user_group_data['row'], user_group_data['col']],
             user_group_data['data'], (NUM_USER, NUM_GROUP),
             dtype=torch.float32)
         total_user_group.append(user_group_data)
-    with open(os.path.join(DATA_PATH, f'links/user-user/{user_user_file}'),
-              'rb') as f:
+
+    with open(
+            os.path.join(args.DATA_PATH, f'links/user-user/{user_user_file}'),
+            'rb') as f:
         user_user_data = pickle.load(f)
         user_user_data = torch.sparse_coo_tensor(
             [user_user_data['row'], user_user_data['col']],
@@ -149,7 +182,12 @@ for behavior_file, user_group_file, user_user_file in tqdm(
             dtype=torch.float32)
         total_user_user.append(user_user_data)
 
-print(f'Number of behaviors: {[len(data) for data in total_behavior]}')
+print(f'Number of training behaviors: {[len(x) for x in train_behavior]}, \
+{[math.ceil(len(x) // args.BATCH_SIZE) for x in train_behavior]} steps')
+print(f'Number of validation behaviors: {len(val_behavior)}, \
+{math.ceil(len(val_behavior) // args.BATCH_SIZE)} steps')
+print(f'Number of testing behaviors: {len(test_behavior)}, \
+{math.ceil(len(test_behavior) // args.BATCH_SIZE)} steps')
 
 # %% [markdown]
 # $r_t$: relation occurred at time t <br>
@@ -172,9 +210,15 @@ print(f'Number of behaviors: {[len(data) for data in total_behavior]}')
 
 # %%
 total_graph = [
-    torch.sparse_coo_tensor(size=(NUM_USER + NUM_GROUP, NUM_USER + NUM_GROUP))
+    torch.sparse_coo_tensor(torch.arange(0,
+                                         NUM_USER + NUM_GROUP).expand(2, -1),
+                            torch.ones(NUM_USER + NUM_GROUP),
+                            size=(NUM_USER + NUM_GROUP, NUM_USER + NUM_GROUP),
+                            dtype=torch.float32).coalesce()
 ]
-for user_user, user_group in zip(total_user_user[:-1], total_user_group[:-1]):
+for user_user, user_group in tqdm(zip(total_user_user[:-1],
+                                      total_user_group[:-1]),
+                                  total=total_time_period - 1):
     # combine the two graphs
     # TODO make sure the scale of user_user and user_group not diff too much
     user_user_indices = user_user._indices()
@@ -207,8 +251,11 @@ for user_user, user_group in zip(total_user_user[:-1], total_user_group[:-1]):
                                             current_graph_values,
                                             size=(NUM_USER + NUM_GROUP,
                                                   NUM_USER + NUM_GROUP))
-    current_graph = torch.pow(current_graph, WEIGHT_SMOOTHING_EXPONENT)
-    total_graph.append(current_graph + total_graph[-1] * DECAY_RATE)
+    current_graph = torch.pow(current_graph, args.WEIGHT_SMOOTHING_EXPONENT)
+    total_graph.append(current_graph + total_graph[-1] * args.DECAY_RATE)
+
+train_graph = total_graph[:TRAIN_NUM]
+val_test_graph = total_graph[TRAIN_NUM]
 
 
 # %%
@@ -285,9 +332,9 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.word_embedding = nn.Embedding.from_pretrained(word_embedding,
                                                            freeze=False)
-        self.attn = AttentionPooling(WORD_EMB_DIM, WORD_EMB_DIM // 2)
-        self.dense = nn.Linear(WORD_EMB_DIM, DESC_DIM)
-        self.dropout = nn.Dropout(p=DROP_RATIO)
+        self.attn = AttentionPooling(args.WORD_EMB_DIM, args.WORD_EMB_DIM // 2)
+        self.dense = nn.Linear(args.WORD_EMB_DIM, args.DESC_DIM)
+        self.dropout = nn.Dropout(p=args.DROP_RATIO)
 
     def forward(self, text_ids):
         '''
@@ -304,8 +351,9 @@ class TextEncoder(nn.Module):
 class TopicEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.topic_embedding = nn.Embedding(NUM_TOPIC, TOPIC_EMB_DIM)
-        self.attn = AttentionPooling(TOPIC_EMB_DIM, TOPIC_EMB_DIM // 2)
+        self.topic_embedding = nn.Embedding(args.NUM_TOPIC, args.TOPIC_EMB_DIM)
+        self.attn = AttentionPooling(args.TOPIC_EMB_DIM,
+                                     args.TOPIC_EMB_DIM // 2)
 
     def forward(self, topic_ids):
         '''
@@ -327,32 +375,35 @@ class GCN(nn.Module):
 
     def forward(self, g, h):
         for layer in self.layers:
-            h = layer(g, h, edge_weight=g.edata['weight'])
+            h = layer(g, h)  # no weight
+            # h = layer(g, h, edge_weight=g.edata['weight'])
         return h
 
 
 class Model(nn.Module):
     def __init__(self, word_embedding):
         super().__init__()
-        self.city_emb = nn.Embedding(NUM_CITY, CITY_EMB_DIM)
-        self.user_id_emb = nn.Embedding(NUM_USER, USER_ID_EMB_DIM)
-        self.group_id_emb = nn.Embedding(NUM_GROUP, GROUP_ID_EMB_DIM)
+        self.city_emb = nn.Embedding(args.NUM_CITY, args.CITY_EMB_DIM)
+        self.user_id_emb = nn.Embedding(NUM_USER, args.USER_ID_EMB_DIM)
+        self.group_id_emb = nn.Embedding(NUM_GROUP, args.GROUP_ID_EMB_DIM)
         self.user_emb_proj = nn.Sequential(
-            nn.Linear(USER_ID_EMB_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM,
-                      USER_EMB_DIM), nn.ReLU())
+            nn.Linear(
+                args.USER_ID_EMB_DIM + args.TOPIC_EMB_DIM + args.CITY_EMB_DIM,
+                args.USER_EMB_DIM), nn.ReLU())
         self.group_emb_proj = nn.Sequential(
             nn.Linear(
-                GROUP_ID_EMB_DIM + TOPIC_EMB_DIM + CITY_EMB_DIM + DESC_DIM,
-                GROUP_EMB_DIM), nn.ReLU())
-        prediction_dim = (USER_EMB_DIM + GROUP_EMB_DIM + CITY_EMB_DIM +
-                          DESC_DIM)
+                args.GROUP_ID_EMB_DIM + args.TOPIC_EMB_DIM +
+                args.CITY_EMB_DIM + args.DESC_DIM, args.GROUP_EMB_DIM),
+            nn.ReLU())
+        prediction_dim = (args.USER_EMB_DIM + args.GROUP_EMB_DIM +
+                          args.CITY_EMB_DIM + args.DESC_DIM)
         self.prediction = nn.Sequential(
             nn.Linear(prediction_dim, prediction_dim // 2), nn.ReLU(),
             nn.Linear(prediction_dim // 2, 1), nn.Sigmoid())
         self.text_encoder = TextEncoder(word_embedding)
         self.topic_encoder = TopicEncoder()
-        assert USER_ID_EMB_DIM == GROUP_ID_EMB_DIM
-        self.gcn_encoder = GCN(USER_ID_EMB_DIM, NUM_GCN_LAYER)
+        assert args.USER_ID_EMB_DIM == args.GROUP_ID_EMB_DIM
+        self.gcn_encoder = GCN(args.USER_ID_EMB_DIM, args.NUM_GCN_LAYER)
         self.loss_fn = nn.BCELoss()
 
     def build_graph(self, graph_data):
@@ -419,7 +470,7 @@ class Model(nn.Module):
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model = Model(word_embedding).to(device)
 print(model)
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+optimizer = torch.optim.Adam(model.parameters(), lr=args.LR)
 
 
 # %%
@@ -446,76 +497,136 @@ def calculate_metrics(pred, truth):
 
 
 # %%
-def run(period_idx, mode):
+def run(mode):
     assert mode in ('train', 'test')
-    dataset = MyDataset(total_behavior[period_idx])
 
     if mode == 'train':
-        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+        if args.USE_WANDB:
+            wandb.init(project="SocialComputing",
+                       name=f'{args.EXP_NAME}-train',
+                       entity="social-computing",
+                       config={
+                           k: getattr(args, k)
+                           for k in dir(args) if not k.startswith('_')
+                       },
+                       group=args.EXP_NAME)
+
         model.train()
-        model.build_graph(total_graph[period_idx].to(device,
-                                                     non_blocking=True))
-        total_acc, total_loss = 0, 0
-        for step, (event_city, event_desc, user_id, user_topic, user_city,
-                   group_id, group_topic, group_city, group_desc,
-                   label) in enumerate(tqdm(dataloader)):
-            event_city = event_city.to(device, non_blocking=True)
-            event_desc = event_desc.to(device, non_blocking=True)
-            user_id = user_id.to(device, non_blocking=True)
-            user_topic = user_topic.to(device, non_blocking=True)
-            user_city = user_city.to(device, non_blocking=True)
-            group_id = group_id.to(device, non_blocking=True)
-            group_topic = group_topic.to(device, non_blocking=True)
-            group_city = group_city.to(device, non_blocking=True)
-            group_desc = group_desc.to(device, non_blocking=True)
-            label = label.float().to(device, non_blocking=True)
+        torch.set_grad_enabled(True)
+        total_step = 0
+        for _ in range(args.EPOCH):
+            for period_idx in range(TRAIN_NUM):
+                train_dataset = MyDataset(train_behavior[period_idx])
+                train_dataloader = DataLoader(train_dataset,
+                                              batch_size=args.BATCH_SIZE,
+                                              shuffle=True)
+                model.build_graph(total_graph[period_idx].to(
+                    device, non_blocking=True))
 
-            y_hat, bz_loss = model(event_city, event_desc, user_id, user_topic,
-                                   user_city, group_id, group_topic,
-                                   group_city, group_desc, label)
-            total_acc += acc(label, y_hat)
-            total_loss += bz_loss.data.float()
-            optimizer.zero_grad()
-            bz_loss.backward()
-            optimizer.step()
+                for (event_city, event_desc, user_id, user_topic, user_city,
+                     group_id, group_topic, group_city, group_desc,
+                     label) in tqdm(train_dataloader):
+                    event_city = event_city.to(device, non_blocking=True)
+                    event_desc = event_desc.to(device, non_blocking=True)
+                    user_id = user_id.to(device, non_blocking=True)
+                    user_topic = user_topic.to(device, non_blocking=True)
+                    user_city = user_city.to(device, non_blocking=True)
+                    group_id = group_id.to(device, non_blocking=True)
+                    group_topic = group_topic.to(device, non_blocking=True)
+                    group_city = group_city.to(device, non_blocking=True)
+                    group_desc = group_desc.to(device, non_blocking=True)
+                    label = label.float().to(device, non_blocking=True)
 
-            if (step + 1) % 100 == 0:
-                print(f'Loss: {total_loss / 100}, Acc: {total_acc / 100}')
-                total_loss, total_acc = 0, 0
-        try:
-            ckpt_path = os.path.join(MODEL_DIR, f'{period_idx}.pt')
-            torch.save(model.state_dict(), ckpt_path)
-        except FileNotFoundError:
-            print('Warning: model dir not found, skip saving model')
+                    y_hat, bz_loss = model(event_city, event_desc, user_id,
+                                           user_topic, user_city, group_id,
+                                           group_topic, group_city, group_desc,
+                                           label)
+                    bz_acc = acc(label, y_hat)
+                    optimizer.zero_grad()
+                    bz_loss.backward()
+                    optimizer.step()
+
+                    if args.USE_WANDB:
+                        wandb.log({
+                            'train/loss': bz_loss,
+                            'train/acc': bz_acc,
+                            'train/step': total_step
+                        })
+
+                    total_step += 1
+                    if total_step % args.SAVE_STEP == 0:
+                        ckpt_path = os.path.join(args.MODEL_DIR,
+                                                 f'ckpt-{total_step}.pt')
+                        torch.save(model.state_dict(), ckpt_path)
+
+        ckpt_path = os.path.join(args.MODEL_DIR, f'ckpt-{total_step}.pt')
+        torch.save(model.state_dict(), ckpt_path)
+        if args.USE_WANDB:
+            wandb.finish()
     else:
-        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+        if args.USE_WANDB:
+            wandb.init(project="SocialComputing",
+                       name=f'{args.EXP_NAME}-test',
+                       entity="social-computing",
+                       config={
+                           k: getattr(args, k)
+                           for k in dir(args) if not k.startswith('_')
+                       },
+                       group=args.EXP_NAME)
+        ckpt_list = fnmatch.filter(os.listdir(args.MODEL_DIR), 'ckpt-*.pt')
+        total_ckpt_num = len(ckpt_list)
+        print('Total ckpt num:', total_ckpt_num)
+        test_dataset = MyDataset(test_behavior)
+        test_dataloader = DataLoader(test_dataset,
+                                     batch_size=args.BATCH_SIZE,
+                                     shuffle=False)
         model.eval()
         torch.set_grad_enabled(False)
-        model.build_graph(total_graph[period_idx].to(device,
-                                                     non_blocking=True))
-        pred, truth = [], []
-        for step, (event_city, event_desc, user_id, user_topic, user_city,
-                   group_id, group_topic, group_city, group_desc,
-                   label) in enumerate(tqdm(dataloader)):
-            event_city = event_city.to(device, non_blocking=True)
-            event_desc = event_desc.to(device, non_blocking=True)
-            user_id = user_id.to(device, non_blocking=True)
-            user_topic = user_topic.to(device, non_blocking=True)
-            user_city = user_city.to(device, non_blocking=True)
-            group_id = group_id.to(device, non_blocking=True)
-            group_topic = group_topic.to(device, non_blocking=True)
-            group_city = group_city.to(device, non_blocking=True)
-            group_desc = group_desc.to(device, non_blocking=True)
-            label = label.to(device, non_blocking=True)
+        for idx, ckpt in enumerate(ckpt_list):
+            step = int(ckpt.split('.')[0].split('-')[-1])
+            print(f'[{idx + 1}/{total_ckpt_num}] Testing {ckpt}')
+            checkpoint = torch.load(os.path.join(args.MODEL_DIR, ckpt))
+            model.load_state_dict(checkpoint)
+            model.build_graph(val_test_graph.to(device, non_blocking=True))
 
-            y_hat, _ = model(event_city, event_desc, user_id, user_topic,
-                             user_city, group_id, group_topic, group_city,
-                             group_desc, label)
-            pred.extend(y_hat.to('cpu').detach().numpy())
-            truth.extent(label.to('cpu').detach().numpy())
+            pred, truth = [], []
+            for (event_city, event_desc, user_id, user_topic, user_city,
+                 group_id, group_topic, group_city, group_desc,
+                 label) in tqdm(test_dataloader):
+                event_city = event_city.to(device, non_blocking=True)
+                event_desc = event_desc.to(device, non_blocking=True)
+                user_id = user_id.to(device, non_blocking=True)
+                user_topic = user_topic.to(device, non_blocking=True)
+                user_city = user_city.to(device, non_blocking=True)
+                group_id = group_id.to(device, non_blocking=True)
+                group_topic = group_topic.to(device, non_blocking=True)
+                group_city = group_city.to(device, non_blocking=True)
+                group_desc = group_desc.to(device, non_blocking=True)
+                label = label.float().to(device, non_blocking=True)
 
-        calculate_metrics(pred, truth)
+                y_hat, _ = model(event_city, event_desc, user_id, user_topic,
+                                 user_city, group_id, group_topic, group_city,
+                                 group_desc, label)
+                pred.extend(y_hat.to('cpu').detach().numpy())
+                truth.extend(label.to('cpu').detach().numpy())
+
+            precision, recall, f1, auc = calculate_metrics(pred, truth)
+            if args.USE_WANDB:
+                wandb.log({
+                    'test/precision': precision,
+                    'test/recall': recall,
+                    'test/f1': f1,
+                    'test/AUC': auc,
+                    'test/step': step
+                })
+        if args.USE_WANDB:
+            wandb.finish()
 
 
 # %%
-run(1, 'train')
+run('train')
+
+# %%
+run('test')
+
+# %%
