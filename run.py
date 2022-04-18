@@ -24,7 +24,7 @@ import math
 import fnmatch
 import wandb
 import dgl
-from dgl.nn.pytorch import GraphConv
+from dgl.nn.pytorch import GraphConv, EdgeWeightNorm
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
@@ -369,14 +369,13 @@ class GCN(nn.Module):
     def __init__(self, feature_dim, num_layers):
         super(GCN, self).__init__()
         self.layers = nn.ModuleList([
-            GraphConv(feature_dim, feature_dim, activation=F.relu)
+            GraphConv(feature_dim, feature_dim, norm='none', activation=F.relu)
             for _ in range(num_layers)
         ])
 
     def forward(self, g, h):
         for layer in self.layers:
-            h = layer(g, h)  # no weight
-            # h = layer(g, h, edge_weight=g.edata['weight'])
+            h = layer(g, h, edge_weight=g.edata['weight'])
         return h
 
 
@@ -402,6 +401,7 @@ class Model(nn.Module):
             nn.Linear(prediction_dim // 2, 1), nn.Sigmoid())
         self.text_encoder = TextEncoder(word_embedding)
         self.topic_encoder = TopicEncoder()
+        self.norm = EdgeWeightNorm(norm='both')
         assert args.USER_ID_EMB_DIM == args.GROUP_ID_EMB_DIM
         self.gcn_encoder = GCN(args.USER_ID_EMB_DIM, args.NUM_GCN_LAYER)
         self.loss_fn = nn.BCELoss()
@@ -409,7 +409,7 @@ class Model(nn.Module):
     def build_graph(self, graph_data):
         self.graph = dgl.graph(tuple([*graph_data.indices()]),
                                num_nodes=NUM_USER + NUM_GROUP)
-        self.graph.edata['weight'] = graph_data.values()
+        self.graph.edata['weight'] = self.norm(self.graph, graph_data.values())
 
     def gcn(self, user_id, group_id):
         """
