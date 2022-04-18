@@ -579,6 +579,7 @@ def run(mode):
                                      shuffle=False)
         model.eval()
         torch.set_grad_enabled(False)
+        best_AUC = 0
         for idx, ckpt in enumerate(ckpt_list):
             step = int(ckpt.split('.')[0].split('-')[-1])
             print(f'[{idx + 1}/{total_ckpt_num}] Testing {ckpt}')
@@ -616,6 +617,15 @@ def run(mode):
                     'test/AUC': auc,
                     'test/step': step
                 })
+
+                if auc > best_AUC:
+                    wandb.run.summary['best_precision'] = precision
+                    wandb.run.summary['best_recall'] = recall
+                    wandb.run.summary['best_f1'] = f1
+                    wandb.run.summary['best_AUC'] = auc
+                    wandb.run.summary['best_step'] = step
+                    best_AUC = auc
+
         if args.USE_WANDB:
             wandb.finish()
 
