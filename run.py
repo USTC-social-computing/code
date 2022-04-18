@@ -24,6 +24,8 @@ import math
 import fnmatch
 import wandb
 import dgl
+import hashlib
+from pathlib import Path
 from dgl.nn.pytorch import GraphConv, EdgeWeightNorm
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -39,6 +41,10 @@ class Args():
         self.DATA_PATH = "./data"
         self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
         self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
+        self.ENABLE_CACHE = True
+        self.CACHE_DIR = "./cache"
+        self.TRAIN_NUM = 93
+        self.VAL_NUM = 5
         self.NUM_CITY = 2675
         self.NUM_TOPIC = 18115
         self.CITY_EMB_DIM = 64
@@ -65,129 +71,113 @@ class Args():
 args = Args()
 os.makedirs(args.MODEL_DIR, exist_ok=True)
 
-# %%
-# get word dict and word embedding table
-with open(os.path.join(args.DATA_PATH, 'word.tsv'), 'r',
-          encoding='utf-8') as f:
-    word_file = f.readlines()[1:]
-
-word_dict = {}
-for line in tqdm(word_file):
-    idx, word = line.strip('\n').split('\t')
-    word_dict[word] = int(idx)
-
-word_embedding = np.random.uniform(size=(len(word_dict), args.WORD_EMB_DIM))
-have_word = 0
-try:
-    with open(args.GLOVE_PATH, 'rb') as f:
-        for line in tqdm(f):
-            line = line.split()
-            word = line[0].decode()
-            if word in word_dict:
-                idx = word_dict[word]
-                tp = [float(x) for x in line[1:]]
-                word_embedding[idx] = np.array(tp)
-                have_word += 1
-except FileNotFoundError:
-    print('Warning: Glove file not found.')
-word_embedding = torch.from_numpy(word_embedding).float()
-
-print(f'Word dict length: {len(word_dict)}')
-print(f'Have words: {have_word}')
-print(f'Missing rate: {(len(word_dict) - have_word) / len(word_dict)}')
 
 # %%
-# get user dict
-with open(os.path.join(args.DATA_PATH, 'user.tsv'), 'r',
-          encoding='utf-8') as f:
-    user_file = f.readlines()[1:]
+def load_from_cache(
+    identifiers,
+    generator,
+    cache_dir,
+    enabled,
+    load_cache_callback=lambda x: print(f'Load cache from {x}'),
+    save_cache_callback=lambda x: print(f'Save cache to {x}')):
+    if not enabled:
+        return generator()
 
-user_dict = {}
-for line in tqdm(user_file):
-    idx, city, topic_list = line.strip('\n').split('\t')
-    user_dict[int(idx)] = (eval(topic_list), int(city))
-
-NUM_USER = len(user_dict)
-print(f'Total user num: {NUM_USER}')
-
-# %%
-# get group dict
-with open(os.path.join(args.DATA_PATH, 'group.tsv'), 'r',
-          encoding='utf-8') as f:
-    group_file = f.readlines()[1:]
-
-group_dict = {}
-for line in tqdm(group_file):
-    idx, city, topic_list, desc = line.strip('\n').split('\t')
-    group_dict[int(idx)] = (eval(topic_list), int(city),
-                            eval(desc)[:args.NUM_GROUP_DESC])
-
-NUM_GROUP = len(group_dict)
-print(f'Total group num: {NUM_GROUP}')
-
-# %%
-# prepare data
-TRAIN_NUM, VAL_NUM = 93, 5
-
-total_behavior_file = sorted(
-    os.listdir(os.path.join(args.DATA_PATH, 'behaviours')))
-total_user_group_file = sorted(
-    os.listdir(os.path.join(args.DATA_PATH, 'links/user-group')))
-total_user_user_file = sorted(
-    os.listdir(os.path.join(args.DATA_PATH, 'links/user-user')))
-
-total_time_period = len(total_behavior_file)
-train_behavior, val_behavior, test_behavior = [], [], []
-total_user_group, total_user_user = [], []
-
-for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
-        tqdm(zip(total_behavior_file, total_user_group_file,
-                 total_user_user_file),
-             total=total_time_period)):
-    behavior_data = []
-    with open(os.path.join(args.DATA_PATH, f'behaviours/{behavior_file}'),
-              'r',
-              encoding='utf-8') as f:
-        behavior_file = f.readlines()[1:]
-    for line in behavior_file:
-        _, group, city, desc, user, label = line.strip('\n').split('\t')
-        behavior_data.append((int(city), eval(desc)[:args.NUM_EVENT_DESC],
-                              int(user), int(group), int(label)))
-    if idx < TRAIN_NUM:
-        random.seed(42)
-        random.shuffle(behavior_data)
-        train_behavior.append(behavior_data)
-    elif idx < TRAIN_NUM + VAL_NUM:
-        val_behavior.extend(behavior_data)
+    identifiers.append(generator.__name__)
+    cache_path = os.path.join(
+        cache_dir,
+        f"{hashlib.md5('-'.join(map(str,identifiers)).encode('utf-8')).hexdigest()}.pkl"
+    )
+    if os.path.isfile(cache_path):
+        with open(cache_path, 'rb') as f:
+            data = pickle.load(f)
+            load_cache_callback(cache_path)
+            return data
     else:
-        test_behavior.extend(behavior_data)
+        data = generator()
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        with open(cache_path, 'wb') as f:
+            pickle.dump(data, f, protocol=4)
+        save_cache_callback(cache_path)
+        return data
 
-    with open(
-            os.path.join(args.DATA_PATH,
-                         f'links/user-group/{user_group_file}'), 'rb') as f:
-        user_group_data = pickle.load(f)
-        user_group_data = torch.sparse_coo_tensor(
-            [user_group_data['row'], user_group_data['col']],
-            user_group_data['data'], (NUM_USER, NUM_GROUP),
-            dtype=torch.float32)
-        total_user_group.append(user_group_data)
 
-    with open(
-            os.path.join(args.DATA_PATH, f'links/user-user/{user_user_file}'),
-            'rb') as f:
-        user_user_data = pickle.load(f)
-        user_user_data = torch.sparse_coo_tensor(
-            [user_user_data['row'], user_user_data['col']],
-            user_user_data['data'], (NUM_USER, NUM_USER),
-            dtype=torch.float32)
-        total_user_user.append(user_user_data)
+# %%
+def generate_word_embedding():
+    # get word dict and word embedding table
+    with open(os.path.join(args.DATA_PATH, 'word.tsv'), 'r',
+              encoding='utf-8') as f:
+        word_file = f.readlines()[1:]
 
-print(f'Number of training behaviors: {[len(x) for x in train_behavior]}, \
-{[math.ceil(len(x) // args.BATCH_SIZE) for x in train_behavior]} steps')
-print(f'Number of validation behaviors: {len(val_behavior)}, \
-{math.ceil(len(val_behavior) // args.BATCH_SIZE)} steps')
-print(f'Number of testing behaviors: {len(test_behavior)}, \
-{math.ceil(len(test_behavior) // args.BATCH_SIZE)} steps')
+    word_dict = {}
+    for line in tqdm(word_file):
+        idx, word = line.strip('\n').split('\t')
+        word_dict[word] = int(idx)
+
+    word_embedding = np.random.uniform(size=(len(word_dict),
+                                             args.WORD_EMB_DIM))
+    have_word = 0
+    try:
+        with open(args.GLOVE_PATH, 'rb') as f:
+            for line in tqdm(f):
+                line = line.split()
+                word = line[0].decode()
+                if word in word_dict:
+                    idx = word_dict[word]
+                    tp = [float(x) for x in line[1:]]
+                    word_embedding[idx] = np.array(tp)
+                    have_word += 1
+    except FileNotFoundError:
+        print('Warning: Glove file not found.')
+    word_embedding = torch.from_numpy(word_embedding).float()
+
+    print(f'Word dict length: {len(word_dict)}')
+    print(f'Have words: {have_word}')
+    print(f'Missing rate: {(len(word_dict) - have_word) / len(word_dict)}')
+
+    return word_embedding
+
+
+word_embedding = load_from_cache([], generate_word_embedding, args.CACHE_DIR,
+                                 args.ENABLE_CACHE)
+
+
+# %%
+def generate_user_and_group_dict():
+    # get user dict
+    with open(os.path.join(args.DATA_PATH, 'user.tsv'), 'r',
+              encoding='utf-8') as f:
+        user_file = f.readlines()[1:]
+
+    user_dict = {}
+    for line in tqdm(user_file):
+        idx, city, topic_list = line.strip('\n').split('\t')
+        user_dict[int(idx)] = (eval(topic_list), int(city))
+
+    NUM_USER = len(user_dict)
+    print(f'Total user num: {NUM_USER}')
+
+    # get group dict
+    with open(os.path.join(args.DATA_PATH, 'group.tsv'), 'r',
+              encoding='utf-8') as f:
+        group_file = f.readlines()[1:]
+
+    group_dict = {}
+    for line in tqdm(group_file):
+        idx, city, topic_list, desc = line.strip('\n').split('\t')
+        group_dict[int(idx)] = (eval(topic_list), int(city),
+                                eval(desc)[:args.NUM_GROUP_DESC])
+
+    NUM_GROUP = len(group_dict)
+    print(f'Total group num: {NUM_GROUP}')
+
+    return user_dict, group_dict
+
+
+user_dict, group_dict = load_from_cache([], generate_user_and_group_dict,
+                                        args.CACHE_DIR, args.ENABLE_CACHE)
+NUM_USER = len(user_dict)
+NUM_GROUP = len(group_dict)
 
 # %% [markdown]
 # $r_t$: relation occurred at time t <br>
@@ -208,54 +198,130 @@ print(f'Number of testing behaviors: {len(test_behavior)}, \
 #
 # Note the scale of $R$ at different times doesn't matter, because of weights normalization in GNN part
 
-# %%
-total_graph = [
-    torch.sparse_coo_tensor(torch.arange(0,
-                                         NUM_USER + NUM_GROUP).expand(2, -1),
-                            torch.ones(NUM_USER + NUM_GROUP),
-                            size=(NUM_USER + NUM_GROUP, NUM_USER + NUM_GROUP),
-                            dtype=torch.float32).coalesce()
-]
-for user_user, user_group in tqdm(zip(total_user_user[:-1],
-                                      total_user_group[:-1]),
-                                  total=total_time_period - 1):
-    # combine the two graphs
-    # TODO make sure the scale of user_user and user_group not diff too much
-    user_user_indices = user_user._indices()
-    user_user_values = user_user._values()
-    user_group_indices = user_group._indices()
-    user_group_values = user_group._values()
-    user_group_indices[1] += NUM_USER
-    user_user_self_loop_value = user_user_values.median()
-    user_group_self_loop_value = user_group_values.median()
-    current_grpah_indices = torch.cat(
-        (
-            user_user_indices,  # top left U-U
-            user_group_indices,  # top right U-G
-            user_group_indices[[1, 0]],  # bottom left G-U
-            torch.arange(0, NUM_USER).expand(2, -1),  # U-U self loop
-            torch.arange(NUM_USER, NUM_USER + NUM_GROUP).expand(
-                2, -1),  # G-G self loop
-        ),
-        dim=1)
-    current_graph_values = torch.cat(
-        (
-            user_user_values,  # top left U-U
-            user_group_values,  # top right U-G
-            user_group_values,  # bottom left G-U
-            user_user_self_loop_value.expand(NUM_USER),  # U-U self loop
-            user_group_self_loop_value.expand(NUM_GROUP),  # G-G self loop
-        ),
-        dim=0)
-    current_graph = torch.sparse_coo_tensor(current_grpah_indices,
-                                            current_graph_values,
-                                            size=(NUM_USER + NUM_GROUP,
-                                                  NUM_USER + NUM_GROUP))
-    current_graph = torch.pow(current_graph, args.WEIGHT_SMOOTHING_EXPONENT)
-    total_graph.append(current_graph + total_graph[-1] * args.DECAY_RATE)
 
-train_graph = total_graph[:TRAIN_NUM]
-val_test_graph = total_graph[TRAIN_NUM]
+# %%
+def generate_behavior_and_graph():
+    # prepare data
+    total_behavior_file = sorted(
+        os.listdir(os.path.join(args.DATA_PATH, 'behaviours')))
+    total_user_group_file = sorted(
+        os.listdir(os.path.join(args.DATA_PATH, 'links/user-group')))
+    total_user_user_file = sorted(
+        os.listdir(os.path.join(args.DATA_PATH, 'links/user-user')))
+
+    total_time_period = len(total_behavior_file)
+    train_behavior, val_behavior, test_behavior = [], [], []
+    total_user_group, total_user_user = [], []
+
+    for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
+            tqdm(zip(total_behavior_file, total_user_group_file,
+                     total_user_user_file),
+                 total=total_time_period)):
+        behavior_data = []
+        with open(os.path.join(args.DATA_PATH, f'behaviours/{behavior_file}'),
+                  'r',
+                  encoding='utf-8') as f:
+            behavior_file = f.readlines()[1:]
+        for line in behavior_file:
+            _, group, city, desc, user, label = line.strip('\n').split('\t')
+            behavior_data.append((int(city), eval(desc)[:args.NUM_EVENT_DESC],
+                                  int(user), int(group), int(label)))
+        if idx < args.TRAIN_NUM:
+            random.seed(42)
+            random.shuffle(behavior_data)
+            train_behavior.append(behavior_data)
+        elif idx < args.TRAIN_NUM + args.VAL_NUM:
+            val_behavior.extend(behavior_data)
+        else:
+            test_behavior.extend(behavior_data)
+
+        with open(
+                os.path.join(args.DATA_PATH,
+                             f'links/user-group/{user_group_file}'),
+                'rb') as f:
+            user_group_data = pickle.load(f)
+            user_group_data = torch.sparse_coo_tensor(
+                [user_group_data['row'], user_group_data['col']],
+                user_group_data['data'], (NUM_USER, NUM_GROUP),
+                dtype=torch.float32)
+            total_user_group.append(user_group_data)
+
+        with open(
+                os.path.join(args.DATA_PATH,
+                             f'links/user-user/{user_user_file}'), 'rb') as f:
+            user_user_data = pickle.load(f)
+            user_user_data = torch.sparse_coo_tensor(
+                [user_user_data['row'], user_user_data['col']],
+                user_user_data['data'], (NUM_USER, NUM_USER),
+                dtype=torch.float32)
+            total_user_user.append(user_user_data)
+
+    print(f'Number of training behaviors: {[len(x) for x in train_behavior]}, \
+    {[math.ceil(len(x) // args.BATCH_SIZE) for x in train_behavior]} steps')
+    print(f'Number of validation behaviors: {len(val_behavior)}, \
+    {math.ceil(len(val_behavior) // args.BATCH_SIZE)} steps')
+    print(f'Number of testing behaviors: {len(test_behavior)}, \
+    {math.ceil(len(test_behavior) // args.BATCH_SIZE)} steps')
+
+    total_graph = [
+        torch.sparse_coo_tensor(
+            torch.arange(0, NUM_USER + NUM_GROUP).expand(2, -1),
+            torch.ones(NUM_USER + NUM_GROUP),
+            size=(NUM_USER + NUM_GROUP, NUM_USER + NUM_GROUP),
+            dtype=torch.float32).coalesce()
+    ]
+    for user_user, user_group in tqdm(zip(total_user_user[:-1],
+                                          total_user_group[:-1]),
+                                      total=total_time_period - 1):
+        # combine the two graphs
+        # TODO make sure the scale of user_user and user_group not diff too much
+        user_user_indices = user_user._indices()
+        user_user_values = user_user._values()
+        user_group_indices = user_group._indices()
+        user_group_values = user_group._values()
+        user_group_indices[1] += NUM_USER
+        user_user_self_loop_value = user_user_values.median()
+        user_group_self_loop_value = user_group_values.median()
+        current_grpah_indices = torch.cat(
+            (
+                user_user_indices,  # top left U-U
+                user_group_indices,  # top right U-G
+                user_group_indices[[1, 0]],  # bottom left G-U
+                torch.arange(0, NUM_USER).expand(2, -1),  # U-U self loop
+                torch.arange(NUM_USER, NUM_USER + NUM_GROUP).expand(
+                    2, -1),  # G-G self loop
+            ),
+            dim=1)
+        current_graph_values = torch.cat(
+            (
+                user_user_values,  # top left U-U
+                user_group_values,  # top right U-G
+                user_group_values,  # bottom left G-U
+                user_user_self_loop_value.expand(NUM_USER),  # U-U self loop
+                user_group_self_loop_value.expand(NUM_GROUP),  # G-G self loop
+            ),
+            dim=0)
+        current_graph = torch.sparse_coo_tensor(current_grpah_indices,
+                                                current_graph_values,
+                                                size=(NUM_USER + NUM_GROUP,
+                                                      NUM_USER + NUM_GROUP))
+        current_graph = torch.pow(current_graph,
+                                  args.WEIGHT_SMOOTHING_EXPONENT)
+        total_graph.append(current_graph + total_graph[-1] * args.DECAY_RATE)
+
+    train_graph = total_graph[:args.TRAIN_NUM]
+    val_test_graph = total_graph[args.TRAIN_NUM]
+
+    return train_behavior, val_behavior, test_behavior, train_graph, val_test_graph
+
+
+train_behavior, val_behavior, test_behavior, train_graph, val_test_graph = load_from_cache(
+    [], generate_behavior_and_graph, args.CACHE_DIR, args.ENABLE_CACHE)
+
+# Loading a sparse tensor from pickle seems to be always uncoalesced...
+for i in range(len(train_graph)):
+    train_graph[i] = train_graph[i].coalesce()
+val_test_graph = val_test_graph.coalesce()
 
 
 # %%
@@ -515,12 +581,12 @@ def run(mode):
         torch.set_grad_enabled(True)
         total_step = 0
         for _ in range(args.EPOCH):
-            for period_idx in range(TRAIN_NUM):
+            for period_idx in range(args.TRAIN_NUM):
                 train_dataset = MyDataset(train_behavior[period_idx])
                 train_dataloader = DataLoader(train_dataset,
                                               batch_size=args.BATCH_SIZE,
                                               shuffle=True)
-                model.build_graph(total_graph[period_idx].to(
+                model.build_graph(train_graph[period_idx].to(
                     device, non_blocking=True))
 
                 for (event_city, event_desc, user_id, user_topic, user_city,
