@@ -598,6 +598,9 @@ def run(mode):
                        },
                        group=args.EXP_NAME)
         ckpt_list = fnmatch.filter(os.listdir(args.MODEL_DIR), 'ckpt-*.pt')
+        ckpt_list = sorted(ckpt_list,
+                           key=lambda x: int(x.split('-')[1].split('.')[0]),
+                           reverse=True)
         total_ckpt_num = len(ckpt_list)
         print('Total ckpt num:', total_ckpt_num)
         hot_test_dataset = MyDataset(hot_test_behavior)
