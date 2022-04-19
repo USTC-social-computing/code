@@ -35,7 +35,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 class Args():
     def __init__(self):
         self.USE_WANDB = True
-        self.EXP_NAME = "no-graph-time-period"
+        self.EXP_NAME = "GCN-1layer-weight"
         self.DATA_PATH = "./data"
         self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
         self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
@@ -55,11 +55,11 @@ class Args():
         self.DROP_RATIO = 0.2
         self.BATCH_SIZE = 32
         self.LR = 0.005
-        self.SAVE_STEP = 1000
-        self.EPOCH = 1
-        self.DECAY_RATE = 0.6
-        self.WEIGHT_SMOOTHING_EXPONENT = 0.5
-        self.NUM_GCN_LAYER = 0  # set to 0 to skip GCN
+        self.SAVE_STEP = 2000
+        self.EPOCH = 3
+        self.DECAY_RATE = 1
+        self.WEIGHT_SMOOTHING_EXPONENT = 1
+        self.NUM_GCN_LAYER = 1  # set to 0 to skip GCN
 
 
 args = Args()
@@ -555,6 +555,9 @@ def run(mode):
                         ckpt_path = os.path.join(args.MODEL_DIR,
                                                  f'ckpt-{total_step}.pt')
                         torch.save(model.state_dict(), ckpt_path)
+
+            ckpt_path = os.path.join(args.MODEL_DIR, f'ckpt-{total_step}.pt')
+            torch.save(model.state_dict(), ckpt_path)
 
         ckpt_path = os.path.join(args.MODEL_DIR, f'ckpt-{total_step}.pt')
         torch.save(model.state_dict(), ckpt_path)
