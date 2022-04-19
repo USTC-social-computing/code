@@ -35,10 +35,11 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 class Args():
     def __init__(self):
         self.USE_WANDB = True
-        self.EXP_NAME = "GCN-1layer-weight"
+        self.EXP_NAME = "no-graph-random"
         self.DATA_PATH = "./data"
         self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
         self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
+        self.CACHE_DIR = "/data/yflyl/CacheData"
         self.NUM_CITY = 2675
         self.NUM_TOPIC = 18115
         self.CITY_EMB_DIM = 64
@@ -59,11 +60,12 @@ class Args():
         self.EPOCH = 3
         self.DECAY_RATE = 1
         self.WEIGHT_SMOOTHING_EXPONENT = 1
-        self.NUM_GCN_LAYER = 1  # set to 0 to skip GCN
+        self.NUM_GCN_LAYER = 0  # set to 0 to skip GCN
 
 
 args = Args()
 os.makedirs(args.MODEL_DIR, exist_ok=True)
+os.makedirs(args.CACHE_DIR, exist_ok=True)
 
 # %%
 # get word dict and word embedding table
@@ -137,48 +139,70 @@ total_user_user_file = sorted(
     os.listdir(os.path.join(args.DATA_PATH, 'links/user-user')))
 
 total_time_period = len(total_behavior_file)
-train_behavior, test_behavior = [], []
-total_user_group, total_user_user = [], []
 
-for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
-        tqdm(zip(total_behavior_file, total_user_group_file,
-                 total_user_user_file),
-             total=total_time_period)):
-    behavior_data = []
-    with open(os.path.join(args.DATA_PATH, f'behaviours/{behavior_file}'),
-              'r',
-              encoding='utf-8') as f:
-        behavior_file = f.readlines()[1:]
-    for line in behavior_file:
-        _, group, city, desc, user, label = line.strip('\n').split('\t')
-        behavior_data.append((int(city), eval(desc)[:args.NUM_EVENT_DESC],
-                              int(user), int(group), int(label)))
-    if idx < TRAIN_NUM:
-        random.seed(42)
-        random.shuffle(behavior_data)
-        train_behavior.append(behavior_data)
-    else:
-        test_behavior.extend(behavior_data)
+cache_file = os.path.join(args.CACHE_DIR, 'data.pkl')
+if os.path.exists(cache_file):
+    with open(cache_file, 'rb') as f:
+        data = pickle.load(f)
+    train_behavior = data['train_behavior']
+    test_behavior = data['test_behavior']
+    total_user_group = data['total_user_group']
+    total_user_user = data['total_user_user']
+    print(f'Loading cache from {cache_file}')
+else:
+    train_behavior, test_behavior = [], []
+    total_user_group, total_user_user = [], []
 
-    with open(
-            os.path.join(args.DATA_PATH,
-                         f'links/user-group/{user_group_file}'), 'rb') as f:
-        user_group_data = pickle.load(f)
-        user_group_data = torch.sparse_coo_tensor(
-            [user_group_data['row'], user_group_data['col']],
-            user_group_data['data'], (NUM_USER, NUM_GROUP),
-            dtype=torch.float32)
-        total_user_group.append(user_group_data)
+    for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
+            tqdm(zip(total_behavior_file, total_user_group_file,
+                     total_user_user_file),
+                 total=total_time_period)):
+        behavior_data = []
+        with open(os.path.join(args.DATA_PATH, f'behaviours/{behavior_file}'),
+                  'r',
+                  encoding='utf-8') as f:
+            behavior_file = f.readlines()[1:]
+        for line in behavior_file:
+            _, group, city, desc, user, label = line.strip('\n').split('\t')
+            behavior_data.append((int(city), eval(desc)[:args.NUM_EVENT_DESC],
+                                  int(user), int(group), int(label)))
+        if idx < TRAIN_NUM:
+            random.seed(42)
+            random.shuffle(behavior_data)
+            train_behavior.append(behavior_data)
+        else:
+            test_behavior.extend(behavior_data)
 
-    with open(
-            os.path.join(args.DATA_PATH, f'links/user-user/{user_user_file}'),
-            'rb') as f:
-        user_user_data = pickle.load(f)
-        user_user_data = torch.sparse_coo_tensor(
-            [user_user_data['row'], user_user_data['col']],
-            user_user_data['data'], (NUM_USER, NUM_USER),
-            dtype=torch.float32)
-        total_user_user.append(user_user_data)
+        with open(
+                os.path.join(args.DATA_PATH,
+                             f'links/user-group/{user_group_file}'),
+                'rb') as f:
+            user_group_data = pickle.load(f)
+            user_group_data = torch.sparse_coo_tensor(
+                [user_group_data['row'], user_group_data['col']],
+                user_group_data['data'], (NUM_USER, NUM_GROUP),
+                dtype=torch.float32)
+            total_user_group.append(user_group_data)
+
+        with open(
+                os.path.join(args.DATA_PATH,
+                             f'links/user-user/{user_user_file}'), 'rb') as f:
+            user_user_data = pickle.load(f)
+            user_user_data = torch.sparse_coo_tensor(
+                [user_user_data['row'], user_user_data['col']],
+                user_user_data['data'], (NUM_USER, NUM_USER),
+                dtype=torch.float32)
+            total_user_user.append(user_user_data)
+
+    with open(cache_file, 'wb') as f:
+        pickle.dump(
+            {
+                'train_behavior': train_behavior,
+                'test_behavior': test_behavior,
+                'total_user_group': total_user_group,
+                'total_user_user': total_user_user
+            }, f)
+    print(f'Saving cache to {cache_file}')
 
 train_behavior_num = sum([len(x) for x in train_behavior])
 print(f'Number of training behaviors: {train_behavior_num}, \
