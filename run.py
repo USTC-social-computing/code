@@ -504,7 +504,7 @@ def calculate_metrics(pred, truth):
     pred = np.array(pred)
     truth = np.array(truth)
     y_pred = pred >= 0.5
-    accuracy = acc(truth, pred)
+    accuracy = np.sum(y_pred == truth) / len(y_pred)
     precision = precision_score(truth, y_pred)
     recall = recall_score(truth, y_pred)
     f1 = f1_score(truth, y_pred)
