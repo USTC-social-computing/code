@@ -35,6 +35,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 class Args():
     def __init__(self):
         self.USE_WANDB = True
+        self.RANDOM_ORDER = True
         self.EXP_NAME = "no-graph-random"
         self.DATA_PATH = "./data"
         self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
@@ -532,11 +533,15 @@ def run(mode):
                        },
                        group=args.EXP_NAME)
 
+        random.seed(42)
         model.train()
         torch.set_grad_enabled(True)
         total_step = 0
         for _ in range(args.EPOCH):
-            for period_idx in range(TRAIN_NUM):
+            train_order = list(range(TRAIN_NUM))
+            if args.RANDOM_ORDER:
+                random.shuffle(train_order)
+            for period_idx in train_order:
                 train_dataset = MyDataset(train_behavior[period_idx])
                 train_dataloader = DataLoader(train_dataset,
                                               batch_size=args.BATCH_SIZE,
@@ -583,8 +588,6 @@ def run(mode):
             ckpt_path = os.path.join(args.MODEL_DIR, f'ckpt-{total_step}.pt')
             torch.save(model.state_dict(), ckpt_path)
 
-        ckpt_path = os.path.join(args.MODEL_DIR, f'ckpt-{total_step}.pt')
-        torch.save(model.state_dict(), ckpt_path)
         if args.USE_WANDB:
             wandb.finish()
     else:
