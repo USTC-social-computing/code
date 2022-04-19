@@ -390,11 +390,13 @@ class GCN(nn.Module):
         ])
 
     def forward(self, g, h):
+        results = [h]
         for i, layer in enumerate(self.layers):
             h = layer(g, h, edge_weight=g.edata['weight'])
             if i != len(self.layers) - 1:
                 h = F.relu(h)
-        return h
+            results.append(h)
+        return torch.cat(results, dim=1)
 
 
 class Model(nn.Module):
@@ -404,14 +406,13 @@ class Model(nn.Module):
         self.user_id_emb = nn.Embedding(NUM_USER, args.USER_ID_EMB_DIM)
         self.group_id_emb = nn.Embedding(NUM_GROUP, args.GROUP_ID_EMB_DIM)
         self.user_emb_proj = nn.Sequential(
-            nn.Linear(
-                args.USER_ID_EMB_DIM + args.TOPIC_EMB_DIM + args.CITY_EMB_DIM,
-                args.USER_EMB_DIM), nn.ReLU())
+            nn.Linear((1 + args.NUM_GCN_LAYER) * args.USER_ID_EMB_DIM +
+                      args.TOPIC_EMB_DIM + args.CITY_EMB_DIM,
+                      args.USER_EMB_DIM), nn.ReLU())
         self.group_emb_proj = nn.Sequential(
-            nn.Linear(
-                args.GROUP_ID_EMB_DIM + args.TOPIC_EMB_DIM +
-                args.CITY_EMB_DIM + args.DESC_DIM, args.GROUP_EMB_DIM),
-            nn.ReLU())
+            nn.Linear((1 + args.NUM_GCN_LAYER) * args.GROUP_ID_EMB_DIM +
+                      args.TOPIC_EMB_DIM + args.CITY_EMB_DIM + args.DESC_DIM,
+                      args.GROUP_EMB_DIM), nn.ReLU())
         prediction_dim = (args.USER_EMB_DIM + args.GROUP_EMB_DIM +
                           args.CITY_EMB_DIM + args.DESC_DIM)
         self.prediction = nn.Sequential(
