@@ -35,8 +35,8 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 class Args():
     def __init__(self):
         self.USE_WANDB = True
-        self.RANDOM_ORDER = True
-        self.EXP_NAME = "no-graph-random"
+        self.RANDOM_ORDER = False
+        self.EXP_NAME = "GCN-1layer-weight"
         self.DATA_PATH = "./data"
         self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
         self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
@@ -61,7 +61,7 @@ class Args():
         self.EPOCH = 3
         self.DECAY_RATE = 1
         self.WEIGHT_SMOOTHING_EXPONENT = 1
-        self.NUM_GCN_LAYER = 0  # set to 0 to skip GCN
+        self.NUM_GCN_LAYER = 1  # set to 0 to skip GCN
 
 
 args = Args()
@@ -146,13 +146,15 @@ if os.path.exists(cache_file):
     with open(cache_file, 'rb') as f:
         data = pickle.load(f)
     train_behavior = data['train_behavior']
-    test_behavior = data['test_behavior']
+    hot_test_behavior = data['hot_test_behavior']
+    cold_test_behavior = data['cold_test_behavior']
     total_user_group = data['total_user_group']
     total_user_user = data['total_user_user']
     print(f'Loading cache from {cache_file}')
 else:
-    train_behavior, test_behavior = [], []
+    train_behavior, hot_test_behavior, cold_test_behavior = [], [], []
     total_user_group, total_user_user = [], []
+    train_user_id, train_group_id = set(), set()
 
     for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
             tqdm(zip(total_behavior_file, total_user_group_file,
@@ -171,8 +173,17 @@ else:
             random.seed(42)
             random.shuffle(behavior_data)
             train_behavior.append(behavior_data)
+            train_user_id.update([line[2] for line in behavior_data])
+            train_group_id.update([line[3] for line in behavior_data])
         else:
-            test_behavior.extend(behavior_data)
+            hot_test_behavior.extend([
+                line for line in behavior_data
+                if (line[2] in train_user_id and line[3] in train_group_id)
+            ])
+            cold_test_behavior.extend([
+                line for line in behavior_data if
+                (line[2] not in train_user_id or line[3] not in train_group_id)
+            ])
 
         with open(
                 os.path.join(args.DATA_PATH,
@@ -199,65 +210,41 @@ else:
         pickle.dump(
             {
                 'train_behavior': train_behavior,
-                'test_behavior': test_behavior,
+                'hot_test_behavior': hot_test_behavior,
+                'cold_test_behavior': cold_test_behavior,
                 'total_user_group': total_user_group,
-                'total_user_user': total_user_user
+                'total_user_user': total_user_user,
             }, f)
     print(f'Saving cache to {cache_file}')
 
 train_behavior_num = sum([len(x) for x in train_behavior])
 print(f'Number of training behaviors: {train_behavior_num}, \
 {math.ceil(train_behavior_num // args.BATCH_SIZE)} steps')
-print(f'Number of testing behaviors: {len(test_behavior)}, \
-{math.ceil(len(test_behavior) // args.BATCH_SIZE)} steps')
-
-# %% [markdown]
-# $r_t$: relation occurred at time t <br>
-# $R_t$: relation used at time t <br>
-# $d$: decay rate
-#
-#
-# $
-# \begin{align}
-# R_0 &= 0 \\
-# R_1 &= r_0 \\
-# \cdots \\
-# R_t &= r_{t-1} + r_{t-2} * d + r_{t-3} * d^2 + ... \\
-#     &= r_{t-1} + d * (r_{t-2} + r_{t-3} * d + ...) \\
-#     &= r_{t-1} + d * R_{t-1}
-# \end{align}
-# $
-#
-# Note the scale of $R$ at different times doesn't matter, because of weights normalization in GNN part
+print(f'Number of hot testing behaviors: {len(hot_test_behavior)}, \
+{math.ceil(len(hot_test_behavior) // args.BATCH_SIZE)} steps')
+print(f'Number of cold testing behaviors: {len(cold_test_behavior)}, \
+{math.ceil(len(cold_test_behavior) // args.BATCH_SIZE)} steps')
 
 # %%
+# prepare graph without self-loop
 total_graph = [
-    torch.sparse_coo_tensor(torch.arange(0,
-                                         NUM_USER + NUM_GROUP).expand(2, -1),
-                            torch.ones(NUM_USER + NUM_GROUP),
-                            size=(NUM_USER + NUM_GROUP, NUM_USER + NUM_GROUP),
-                            dtype=torch.float32).coalesce()
+    torch.sparse_coo_tensor(size=(NUM_USER + NUM_GROUP, NUM_USER + NUM_GROUP),
+                            dtype=torch.float32)
 ]
 for user_user, user_group in tqdm(zip(total_user_user[:-1],
                                       total_user_group[:-1]),
                                   total=total_time_period - 1):
     # combine the two graphs
-    # TODO make sure the scale of user_user and user_group not diff too much
     user_user_indices = user_user._indices()
     user_user_values = user_user._values()
     user_group_indices = user_group._indices()
     user_group_values = user_group._values()
     user_group_indices[1] += NUM_USER
-    user_user_self_loop_value = user_user_values.median()
-    user_group_self_loop_value = user_group_values.median()
-    current_grpah_indices = torch.cat(
+    current_graph_indices = torch.cat(
         (
             user_user_indices,  # top left U-U
             user_group_indices,  # top right U-G
             user_group_indices[[1, 0]],  # bottom left G-U
-            torch.arange(0, NUM_USER).expand(2, -1),  # U-U self loop
-            torch.arange(NUM_USER, NUM_USER + NUM_GROUP).expand(
-                2, -1),  # G-G self loop
         ),
         dim=1)
     current_graph_values = torch.cat(
@@ -265,16 +252,23 @@ for user_user, user_group in tqdm(zip(total_user_user[:-1],
             user_user_values,  # top left U-U
             user_group_values,  # top right U-G
             user_group_values,  # bottom left G-U
-            user_user_self_loop_value.expand(NUM_USER),  # U-U self loop
-            user_group_self_loop_value.expand(NUM_GROUP),  # G-G self loop
         ),
         dim=0)
-    current_graph = torch.sparse_coo_tensor(current_grpah_indices,
+    current_graph = torch.sparse_coo_tensor(current_graph_indices,
                                             current_graph_values,
                                             size=(NUM_USER + NUM_GROUP,
                                                   NUM_USER + NUM_GROUP))
     current_graph = torch.pow(current_graph, args.WEIGHT_SMOOTHING_EXPONENT)
     total_graph.append(current_graph + total_graph[-1] * args.DECAY_RATE)
+
+# add self_loop
+self_loop = torch.sparse_coo_tensor(torch.arange(0,
+                                                 NUM_USER + NUM_GROUP).expand(
+                                                     2, -1),
+                                    torch.ones(NUM_USER + NUM_GROUP),
+                                    dtype=torch.float32)
+for i in range(len(total_graph)):
+    total_graph[i] = (total_graph[i] + self_loop).coalesce()
 
 train_graph = total_graph[:TRAIN_NUM]
 val_test_graph = total_graph[TRAIN_NUM]
@@ -391,13 +385,15 @@ class GCN(nn.Module):
     def __init__(self, feature_dim, num_layers):
         super(GCN, self).__init__()
         self.layers = nn.ModuleList([
-            GraphConv(feature_dim, feature_dim, norm='none', activation=F.relu)
+            GraphConv(feature_dim, feature_dim, norm='none')
             for _ in range(num_layers)
         ])
 
     def forward(self, g, h):
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             h = layer(g, h, edge_weight=g.edata['weight'])
+            if i != len(self.layers) - 1:
+                h = F.relu(h)
         return h
 
 
@@ -508,14 +504,14 @@ def calculate_metrics(pred, truth):
     pred = np.array(pred)
     truth = np.array(truth)
     y_pred = pred >= 0.5
+    accuracy = acc(truth, pred)
     precision = precision_score(truth, y_pred)
     recall = recall_score(truth, y_pred)
     f1 = f1_score(truth, y_pred)
     auc = roc_auc_score(truth, pred)
-    print(
-        f'Precision: {precision:.4f}\tRecall: {recall:.4f}\tF1: {f1:.4f}\tAUC: {auc:.4f}'
-    )
-    return precision, recall, f1, auc
+    print(f'Accuracy: {accuracy:.4f}\tPrecision: {precision:.4f}\t\
+Recall: {recall:.4f}\tF1: {f1:.4f}\tAUC: {auc:.4f}')
+    return accuracy, precision, recall, f1, auc
 
 
 # %%
@@ -603,10 +599,14 @@ def run(mode):
         ckpt_list = fnmatch.filter(os.listdir(args.MODEL_DIR), 'ckpt-*.pt')
         total_ckpt_num = len(ckpt_list)
         print('Total ckpt num:', total_ckpt_num)
-        test_dataset = MyDataset(test_behavior)
-        test_dataloader = DataLoader(test_dataset,
-                                     batch_size=args.BATCH_SIZE,
-                                     shuffle=False)
+        hot_test_dataset = MyDataset(hot_test_behavior)
+        hot_test_dataloader = DataLoader(hot_test_dataset,
+                                         batch_size=args.BATCH_SIZE,
+                                         shuffle=False)
+        cold_test_dataset = MyDataset(cold_test_behavior)
+        cold_test_dataloader = DataLoader(cold_test_dataset,
+                                          batch_size=args.BATCH_SIZE,
+                                          shuffle=False)
         model.eval()
         torch.set_grad_enabled(False)
         best_AUC = 0
@@ -617,10 +617,10 @@ def run(mode):
             model.load_state_dict(checkpoint)
             model.build_graph(val_test_graph.to(device, non_blocking=True))
 
-            pred, truth = [], []
+            hot_pred, hot_truth = [], []
             for (event_city, event_desc, user_id, user_topic, user_city,
                  group_id, group_topic, group_city, group_desc,
-                 label) in tqdm(test_dataloader):
+                 label) in tqdm(hot_test_dataloader):
                 event_city = event_city.to(device, non_blocking=True)
                 event_desc = event_desc.to(device, non_blocking=True)
                 user_id = user_id.to(device, non_blocking=True)
@@ -635,26 +635,64 @@ def run(mode):
                 y_hat, _ = model(event_city, event_desc, user_id, user_topic,
                                  user_city, group_id, group_topic, group_city,
                                  group_desc, label)
-                pred.extend(y_hat.to('cpu').detach().numpy())
-                truth.extend(label.to('cpu').detach().numpy())
+                hot_pred.extend(y_hat.to('cpu').detach().numpy())
+                hot_truth.extend(label.to('cpu').detach().numpy())
 
-            precision, recall, f1, auc = calculate_metrics(pred, truth)
+            cold_pred, cold_truth = [], []
+            for (event_city, event_desc, user_id, user_topic, user_city,
+                 group_id, group_topic, group_city, group_desc,
+                 label) in tqdm(cold_test_dataloader):
+                event_city = event_city.to(device, non_blocking=True)
+                event_desc = event_desc.to(device, non_blocking=True)
+                user_id = user_id.to(device, non_blocking=True)
+                user_topic = user_topic.to(device, non_blocking=True)
+                user_city = user_city.to(device, non_blocking=True)
+                group_id = group_id.to(device, non_blocking=True)
+                group_topic = group_topic.to(device, non_blocking=True)
+                group_city = group_city.to(device, non_blocking=True)
+                group_desc = group_desc.to(device, non_blocking=True)
+                label = label.float().to(device, non_blocking=True)
+
+                y_hat, _ = model(event_city, event_desc, user_id, user_topic,
+                                 user_city, group_id, group_topic, group_city,
+                                 group_desc, label)
+                cold_pred.extend(y_hat.to('cpu').detach().numpy())
+                cold_truth.extend(label.to('cpu').detach().numpy())
+
+            total_pred = hot_pred + cold_pred
+            total_truth = hot_truth + cold_truth
+            hot_metrics = calculate_metrics(hot_pred, hot_truth)
+            cold_metrics = calculate_metrics(cold_pred, cold_truth)
+            overall_metrics = calculate_metrics(total_pred, total_truth)
+
             if args.USE_WANDB:
                 wandb.log({
-                    'test/precision': precision,
-                    'test/recall': recall,
-                    'test/f1': f1,
-                    'test/AUC': auc,
+                    'test/hot/accuracy': hot_metrics[0],
+                    'test/hot/precision': hot_metrics[1],
+                    'test/hot/recall': hot_metrics[2],
+                    'test/hot/f1': hot_metrics[3],
+                    'test/hot/AUC': hot_metrics[4],
+                    'test/cold/accuracy': cold_metrics[0],
+                    'test/cold/precision': cold_metrics[1],
+                    'test/cold/recall': cold_metrics[2],
+                    'test/cold/f1': cold_metrics[3],
+                    'test/cold/AUC': cold_metrics[4],
+                    'test/overall/accuracy': overall_metrics[0],
+                    'test/overall/precision': overall_metrics[1],
+                    'test/overall/recall': overall_metrics[2],
+                    'test/overall/f1': overall_metrics[3],
+                    'test/overall/AUC': overall_metrics[4],
                     'test/step': step
                 })
 
-                if auc > best_AUC:
-                    wandb.run.summary['best_precision'] = precision
-                    wandb.run.summary['best_recall'] = recall
-                    wandb.run.summary['best_f1'] = f1
-                    wandb.run.summary['best_AUC'] = auc
+                if overall_metrics[4] > best_AUC:
+                    wandb.run.summary['best_accuracy'] = overall_metrics[0]
+                    wandb.run.summary['best_precision'] = overall_metrics[1]
+                    wandb.run.summary['best_recall'] = overall_metrics[2]
+                    wandb.run.summary['best_f1'] = overall_metrics[3]
+                    wandb.run.summary['best_AUC'] = overall_metrics[4]
                     wandb.run.summary['best_step'] = step
-                    best_AUC = auc
+                    best_AUC = overall_metrics[4]
 
         if args.USE_WANDB:
             wandb.finish()
