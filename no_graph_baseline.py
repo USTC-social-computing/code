@@ -22,8 +22,10 @@ import random
 import math
 import fnmatch
 import wandb
+import pickle
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+from collections import Counter
 
 
 # %%
@@ -34,6 +36,7 @@ class Args():
         self.DATA_PATH = "./data"
         self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
         self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
+        self.CACHE_DIR = "/data/yflyl/CacheData"
         self.NUM_CITY = 2675
         self.NUM_TOPIC = 18115
         self.CITY_EMB_DIM = 64
@@ -50,12 +53,15 @@ class Args():
         self.DROP_RATIO = 0.2
         self.BATCH_SIZE = 32
         self.LR = 0.005
-        self.SAVE_STEP = 1000
-        self.EPOCH = 1
+        self.SAVE_STEP = 2000
+        self.EPOCH = 3
+        self.COLD_USER_THRES = 2
+        self.COLD_GROUP_THRES = 5
 
 
 args = Args()
 os.makedirs(args.MODEL_DIR, exist_ok=True)
+os.makedirs(args.CACHE_DIR, exist_ok=True)
 
 # %%
 # get word dict and word embedding table
@@ -119,30 +125,69 @@ print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-TRAIN_NUM, VAL_NUM = 93, 5
+TRAIN_NUM = 97
 
 total_behavior_file = sorted(
     os.listdir(os.path.join(args.DATA_PATH, 'behaviours')))
 
 total_time_period = len(total_behavior_file)
-train_behavior, val_behavior, test_behavior = [], [], []
 
-for idx, behavior_file in enumerate(tqdm(total_behavior_file)):
-    behavior_data = []
-    with open(os.path.join(args.DATA_PATH, f'behaviours/{behavior_file}'),
-              'r',
-              encoding='utf-8') as f:
-        behavior_file = f.readlines()[1:]
-    for line in behavior_file:
-        _, group, city, desc, user, label = line.strip('\n').split('\t')
-        behavior_data.append((int(city), eval(desc)[:args.NUM_EVENT_DESC],
-                              int(user), int(group), int(label)))
-    if idx < TRAIN_NUM:
-        train_behavior.extend(behavior_data)
-    elif idx < TRAIN_NUM + VAL_NUM:
-        val_behavior.extend(behavior_data)
-    else:
-        test_behavior.extend(behavior_data)
+cache_file = os.path.join(args.CACHE_DIR, 'baseline.pkl')
+if os.path.exists(cache_file):
+    with open(cache_file, 'rb') as f:
+        data = pickle.load(f)
+    train_behavior = data['train_behavior']
+    hot_test_behavior = data['hot_test_behavior']
+    cold_test_behavior = data['cold_test_behavior']
+    new_test_behavior = data['new_test_behavior']
+    print(f'Loading cache from {cache_file}')
+else:
+    train_behavior = []
+    hot_test_behavior, cold_test_behavior, new_test_behavior = [], [], []
+    train_user_id, train_group_id = Counter(), Counter()
+
+    for idx, behavior_file in enumerate(tqdm(total_behavior_file)):
+        with open(os.path.join(args.DATA_PATH, f'behaviours/{behavior_file}'),
+                  'r',
+                  encoding='utf-8') as f:
+            behavior_file = f.readlines()[1:]
+        if idx < TRAIN_NUM:
+            behavior_data = []
+            for line in behavior_file:
+                _, group, city, desc, user, label = line.strip('\n').split(
+                    '\t')
+                user, group = int(user), int(group)
+                behavior_data.append(
+                    (int(city), eval(desc)[:args.NUM_EVENT_DESC], user, group,
+                     int(label)))
+                train_user_id.update([user])
+                train_group_id.update([group])
+            train_behavior.extend(behavior_data)
+        else:
+            for line in behavior_file:
+                _, group, city, desc, user, label = line.strip('\n').split(
+                    '\t')
+                user, group = int(user), int(group)
+                behavior_tuple = (int(city), eval(desc)[:args.NUM_EVENT_DESC],
+                                  user, group, int(label))
+                if user not in train_user_id or group not in train_group_id:
+                    new_test_behavior.append(behavior_tuple)
+                elif train_user_id[
+                        user] <= args.COLD_USER_THRES or train_group_id[
+                            group] <= args.COLD_GROUP_THRES:
+                    cold_test_behavior.append(behavior_tuple)
+                else:
+                    hot_test_behavior.append(behavior_tuple)
+
+    with open(cache_file, 'wb') as f:
+        pickle.dump(
+            {
+                'train_behavior': train_behavior,
+                'hot_test_behavior': hot_test_behavior,
+                'cold_test_behavior': cold_test_behavior,
+                'new_test_behavior': new_test_behavior,
+            }, f)
+    print(f'Saving cache to {cache_file}')
 
 random.seed(42)
 random.shuffle(train_behavior)
@@ -150,10 +195,13 @@ print(
     f'Number of training behaviors: {len(train_behavior)}, {math.ceil(len(train_behavior) // args.BATCH_SIZE)} steps'
 )
 print(
-    f'Number of validation behaviors: {len(val_behavior)}, {math.ceil(len(val_behavior) // args.BATCH_SIZE)} steps'
+    f'Number of hot testing behaviors: {len(hot_test_behavior)}, {math.ceil(len(hot_test_behavior) // args.BATCH_SIZE)} steps'
 )
 print(
-    f'Number of testing behaviors: {len(test_behavior)}, {math.ceil(len(test_behavior) // args.BATCH_SIZE)} steps'
+    f'Number of cold testing behaviors: {len(cold_test_behavior)}, {math.ceil(len(cold_test_behavior) // args.BATCH_SIZE)} steps'
+)
+print(
+    f'Number of new testing behaviors: {len(new_test_behavior)}, {math.ceil(len(new_test_behavior) // args.BATCH_SIZE)} steps'
 )
 
 
@@ -335,7 +383,7 @@ class Model(nn.Module):
 
 
 # %%
-device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model = Model(word_embedding).to(device)
 print(model)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.LR)
@@ -354,14 +402,14 @@ def calculate_metrics(pred, truth):
     pred = np.array(pred)
     truth = np.array(truth)
     y_pred = pred >= 0.5
+    accuracy = np.sum(y_pred == truth) / len(y_pred)
     precision = precision_score(truth, y_pred)
     recall = recall_score(truth, y_pred)
     f1 = f1_score(truth, y_pred)
     auc = roc_auc_score(truth, pred)
-    print(
-        f'Precision: {precision:.4f}\tRecall: {recall:.4f}\tF1: {f1:.4f}\tAUC: {auc:.4f}'
-    )
-    return precision, recall, f1, auc
+    print(f'Accuracy: {accuracy:.4f}\tPrecision: {precision:.4f}\t\
+Recall: {recall:.4f}\tF1: {f1:.4f}\tAUC: {auc:.4f}')
+    return accuracy, precision, recall, f1, auc
 
 
 # %%
@@ -371,7 +419,7 @@ def run(mode):
     if mode == 'train':
         wandb.init(project="SocialComputing",
                    name=f'{args.EXP_NAME}-train',
-                   entity="yflyl613",
+                   entity="social-computing",
                    config={
                        k: getattr(args, k)
                        for k in dir(args) if not k.startswith('_')
@@ -381,17 +429,13 @@ def run(mode):
         train_dataloader = DataLoader(train_dataset,
                                       batch_size=args.BATCH_SIZE,
                                       shuffle=True)
-        val_dataset = MyDataset(val_behavior)
-        val_dataloader = DataLoader(val_dataset,
-                                    batch_size=args.BATCH_SIZE,
-                                    shuffle=False)
         model.train()
         torch.set_grad_enabled(True)
-        for ep in range(args.EPOCH):
-            for step, (event_city, event_desc, user_id, user_topic, user_city,
-                       group_id, group_topic, group_city, group_desc,
-                       label) in enumerate(tqdm(train_dataloader)):
-                step += ep * len(train_dataloader)
+        total_step = 0
+        for _ in range(args.EPOCH):
+            for (event_city, event_desc, user_id, user_topic, user_city,
+                 group_id, group_topic, group_city, group_desc,
+                 label) in tqdm(train_dataloader):
                 event_city = event_city.to(device, non_blocking=True)
                 event_desc = event_desc.to(device, non_blocking=True)
                 user_id = user_id.to(device, non_blocking=True)
@@ -415,76 +459,45 @@ def run(mode):
                 wandb.log({
                     'train/loss': bz_loss,
                     'train/acc': bz_acc,
-                    'train/step': step
+                    'train/step': total_step
                 })
 
-                if (step + 1) % args.SAVE_STEP == 0:
+                total_step += 1
+                if total_step % args.SAVE_STEP == 0:
                     ckpt_path = os.path.join(args.MODEL_DIR,
-                                             f'ckpt-{step + 1}.pt')
+                                             f'ckpt-{total_step}.pt')
                     torch.save(model.state_dict(), ckpt_path)
 
-                    model.eval()
-                    torch.set_grad_enabled(False)
-                    pred, truth = [], []
-                    with torch.no_grad():
-                        for (event_city, event_desc, user_id, user_topic,
-                             user_city, group_id, group_topic, group_city,
-                             group_desc, label) in tqdm(val_dataloader):
-                            event_city = event_city.to(device,
-                                                       non_blocking=True)
-                            event_desc = event_desc.to(device,
-                                                       non_blocking=True)
-                            user_id = user_id.to(device, non_blocking=True)
-                            user_topic = user_topic.to(device,
-                                                       non_blocking=True)
-                            user_city = user_city.to(device, non_blocking=True)
-                            group_id = group_id.to(device, non_blocking=True)
-                            group_topic = group_topic.to(device,
-                                                         non_blocking=True)
-                            group_city = group_city.to(device,
-                                                       non_blocking=True)
-                            group_desc = group_desc.to(device,
-                                                       non_blocking=True)
-                            label = label.float().to(device, non_blocking=True)
-
-                            y_hat, _ = model(event_city, event_desc, user_id,
-                                             user_topic, user_city, group_id,
-                                             group_topic, group_city,
-                                             group_desc, label)
-                            pred.extend(y_hat.to('cpu').detach().numpy())
-                            truth.extend(label.to('cpu').detach().numpy())
-                    precision, recall, f1, auc = calculate_metrics(pred, truth)
-
-                    wandb.log({
-                        'val/precision': precision,
-                        'val/recall': recall,
-                        'val/f1': f1,
-                        'val/AUC': auc,
-                        'val/step': step
-                    })
-
-                    model.train()
-                    torch.set_grad_enabled(True)
-
-        ckpt_path = os.path.join(args.MODEL_DIR, f'ckpt-{step + 1}.pt')
-        torch.save(model.state_dict(), ckpt_path)
+            ckpt_path = os.path.join(args.MODEL_DIR, f'ckpt-{total_step}.pt')
+            torch.save(model.state_dict(), ckpt_path)
         wandb.finish()
     else:
         wandb.init(project="SocialComputing",
                    name=f'{args.EXP_NAME}-test',
-                   entity="yflyl613",
+                   entity="social-computing",
                    config={
                        k: getattr(args, k)
                        for k in dir(args) if not k.startswith('_')
                    },
                    group=args.EXP_NAME)
         ckpt_list = fnmatch.filter(os.listdir(args.MODEL_DIR), 'ckpt-*.pt')
+        ckpt_list = sorted(ckpt_list,
+                           key=lambda x: int(x.split('-')[1].split('.')[0]),
+                           reverse=True)
         total_ckpt_num = len(ckpt_list)
         print('Total ckpt num:', total_ckpt_num)
-        test_dataset = MyDataset(test_behavior)
-        test_dataloader = DataLoader(test_dataset,
-                                     batch_size=args.BATCH_SIZE,
-                                     shuffle=False)
+        hot_test_dataset = MyDataset(hot_test_behavior)
+        hot_test_dataloader = DataLoader(hot_test_dataset,
+                                         batch_size=args.BATCH_SIZE,
+                                         shuffle=False)
+        cold_test_dataset = MyDataset(cold_test_behavior)
+        cold_test_dataloader = DataLoader(cold_test_dataset,
+                                          batch_size=args.BATCH_SIZE,
+                                          shuffle=False)
+        new_test_dataset = MyDataset(new_test_behavior)
+        new_test_dataloader = DataLoader(new_test_dataset,
+                                         batch_size=args.BATCH_SIZE,
+                                         shuffle=False)
         model.eval()
         torch.set_grad_enabled(False)
         for idx, ckpt in enumerate(ckpt_list):
@@ -492,35 +505,75 @@ def run(mode):
             print(f'[{idx + 1}/{total_ckpt_num}] Testing {ckpt}')
             checkpoint = torch.load(os.path.join(args.MODEL_DIR, ckpt))
             model.load_state_dict(checkpoint)
-            pred, truth = [], []
-            for (event_city, event_desc, user_id, user_topic, user_city,
-                 group_id, group_topic, group_city, group_desc,
-                 label) in tqdm(test_dataloader):
-                event_city = event_city.to(device, non_blocking=True)
-                event_desc = event_desc.to(device, non_blocking=True)
-                user_id = user_id.to(device, non_blocking=True)
-                user_topic = user_topic.to(device, non_blocking=True)
-                user_city = user_city.to(device, non_blocking=True)
-                group_id = group_id.to(device, non_blocking=True)
-                group_topic = group_topic.to(device, non_blocking=True)
-                group_city = group_city.to(device, non_blocking=True)
-                group_desc = group_desc.to(device, non_blocking=True)
-                label = label.float().to(device, non_blocking=True)
 
-                y_hat, _ = model(event_city, event_desc, user_id, user_topic,
-                                 user_city, group_id, group_topic, group_city,
-                                 group_desc, label)
-                pred.extend(y_hat.to('cpu').detach().numpy())
-                truth.extend(label.to('cpu').detach().numpy())
+            pred = {'hot': [], 'cold': [], 'new': []}
+            truth = {'hot': [], 'cold': [], 'new': []}
+            metrics = {'hot': None, 'cold': None, 'new': None}
 
-            precision, recall, f1, auc = calculate_metrics(pred, truth)
+            for name, dataloader in zip(['hot', 'cold', 'new'], [
+                    hot_test_dataloader, cold_test_dataloader,
+                    new_test_dataloader
+            ]):
+                for (event_city, event_desc, user_id, user_topic, user_city,
+                     group_id, group_topic, group_city, group_desc,
+                     label) in tqdm(dataloader):
+                    event_city = event_city.to(device, non_blocking=True)
+                    event_desc = event_desc.to(device, non_blocking=True)
+                    user_id = user_id.to(device, non_blocking=True)
+                    user_topic = user_topic.to(device, non_blocking=True)
+                    user_city = user_city.to(device, non_blocking=True)
+                    group_id = group_id.to(device, non_blocking=True)
+                    group_topic = group_topic.to(device, non_blocking=True)
+                    group_city = group_city.to(device, non_blocking=True)
+                    group_desc = group_desc.to(device, non_blocking=True)
+                    label = label.float().to(device, non_blocking=True)
+
+                    y_hat, _ = model(event_city, event_desc, user_id,
+                                     user_topic, user_city, group_id,
+                                     group_topic, group_city, group_desc,
+                                     label)
+                    pred[name].extend(y_hat.to('cpu').detach().numpy())
+                    truth[name].extend(label.to('cpu').detach().numpy())
+                metrics[name] = calculate_metrics(pred[name], truth[name])
+
+            total_pred = pred['hot'] + pred['cold'] + pred['new']
+            total_truth = truth['hot'] + truth['cold'] + truth['new']
+            overall_metrics = calculate_metrics(total_pred, total_truth)
+            metrics['overall'] = overall_metrics
+
             wandb.log({
-                'test/precision': precision,
-                'test/recall': recall,
-                'test/f1': f1,
-                'test/AUC': auc,
+                'test/hot/accuracy': metrics['hot'][0],
+                'test/hot/precision': metrics['hot'][1],
+                'test/hot/recall': metrics['hot'][2],
+                'test/hot/f1': metrics['hot'][3],
+                'test/hot/AUC': metrics['hot'][4],
+                'test/cold/accuracy': metrics['cold'][0],
+                'test/cold/precision': metrics['cold'][1],
+                'test/cold/recall': metrics['cold'][2],
+                'test/cold/f1': metrics['cold'][3],
+                'test/cold/AUC': metrics['cold'][4],
+                'test/new/accuracy': metrics['new'][0],
+                'test/new/precision': metrics['new'][1],
+                'test/new/recall': metrics['new'][2],
+                'test/new/f1': metrics['new'][3],
+                'test/new/AUC': metrics['new'][4],
+                'test/overall/accuracy': metrics['overall'][0],
+                'test/overall/precision': metrics['overall'][1],
+                'test/overall/recall': metrics['overall'][2],
+                'test/overall/f1': metrics['overall'][3],
+                'test/overall/AUC': metrics['overall'][4],
                 'test/step': step
             })
+
+            if metrics['overall'][4] > best_AUC:
+                wandb.run.summary['best_accuracy'] = metrics['overall'][0]
+                wandb.run.summary['best_precision'] = metrics['overall'][1]
+                wandb.run.summary['best_recall'] = metrics['overall'][2]
+                wandb.run.summary['best_f1'] = metrics['overall'][3]
+                wandb.run.summary['best_AUC'] = metrics['overall'][4]
+                wandb.run.summary['best_step'] = step
+                best_AUC = overall_metrics[4]
+
         wandb.finish()
 
 
