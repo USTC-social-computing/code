@@ -500,6 +500,7 @@ def run(mode):
                                          shuffle=False)
         model.eval()
         torch.set_grad_enabled(False)
+        best_AUC = 0
         for idx, ckpt in enumerate(ckpt_list):
             step = int(ckpt.split('.')[0].split('-')[-1])
             print(f'[{idx + 1}/{total_ckpt_num}] Testing {ckpt}')
@@ -572,7 +573,7 @@ def run(mode):
                 wandb.run.summary['best_f1'] = metrics['overall'][3]
                 wandb.run.summary['best_AUC'] = metrics['overall'][4]
                 wandb.run.summary['best_step'] = step
-                best_AUC = overall_metrics[4]
+                best_AUC = metrics['overall'][4]
 
         wandb.finish()
 
