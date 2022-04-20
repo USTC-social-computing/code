@@ -28,6 +28,7 @@ from dgl.nn.pytorch import GraphConv, EdgeWeightNorm
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
+from collections import Counter
 
 
 # %%
@@ -35,8 +36,8 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 class Args():
     def __init__(self):
         self.USE_WANDB = True
-        self.RANDOM_ORDER = False
-        self.EXP_NAME = "GCN-1layer-weight"
+        self.RANDOM_ORDER = True
+        self.EXP_NAME = "GCN-1layer-weight-random"
         self.DATA_PATH = "./data"
         self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
         self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
@@ -62,6 +63,8 @@ class Args():
         self.DECAY_RATE = 1
         self.WEIGHT_SMOOTHING_EXPONENT = 1
         self.NUM_GCN_LAYER = 1  # set to 0 to skip GCN
+        self.COLD_USER_THRES = 2
+        self.COLD_GROUP_THRES = 5
 
 
 args = Args()
@@ -148,42 +151,53 @@ if os.path.exists(cache_file):
     train_behavior = data['train_behavior']
     hot_test_behavior = data['hot_test_behavior']
     cold_test_behavior = data['cold_test_behavior']
+    new_test_behavior = data['new_test_behavior']
     total_user_group = data['total_user_group']
     total_user_user = data['total_user_user']
     print(f'Loading cache from {cache_file}')
 else:
-    train_behavior, hot_test_behavior, cold_test_behavior = [], [], []
+    train_behavior = []
+    hot_test_behavior, cold_test_behavior, new_test_behavior = [], [], []
     total_user_group, total_user_user = [], []
-    train_user_id, train_group_id = set(), set()
+    train_user_id, train_group_id = Counter(), Counter()
 
     for idx, (behavior_file, user_group_file, user_user_file) in enumerate(
             tqdm(zip(total_behavior_file, total_user_group_file,
                      total_user_user_file),
                  total=total_time_period)):
-        behavior_data = []
         with open(os.path.join(args.DATA_PATH, f'behaviours/{behavior_file}'),
                   'r',
                   encoding='utf-8') as f:
             behavior_file = f.readlines()[1:]
-        for line in behavior_file:
-            _, group, city, desc, user, label = line.strip('\n').split('\t')
-            behavior_data.append((int(city), eval(desc)[:args.NUM_EVENT_DESC],
-                                  int(user), int(group), int(label)))
         if idx < TRAIN_NUM:
+            behavior_data = []
+            for line in behavior_file:
+                _, group, city, desc, user, label = line.strip('\n').split(
+                    '\t')
+                user, group = int(user), int(group)
+                behavior_data.append(
+                    (int(city), eval(desc)[:args.NUM_EVENT_DESC], user, group,
+                     int(label)))
+                train_user_id.update([user])
+                train_group_id.update([group])
             random.seed(42)
             random.shuffle(behavior_data)
             train_behavior.append(behavior_data)
-            train_user_id.update([line[2] for line in behavior_data])
-            train_group_id.update([line[3] for line in behavior_data])
         else:
-            hot_test_behavior.extend([
-                line for line in behavior_data
-                if (line[2] in train_user_id and line[3] in train_group_id)
-            ])
-            cold_test_behavior.extend([
-                line for line in behavior_data if
-                (line[2] not in train_user_id or line[3] not in train_group_id)
-            ])
+            for line in behavior_file:
+                _, group, city, desc, user, label = line.strip('\n').split(
+                    '\t')
+                user, group = int(user), int(group)
+                behavior_tuple = (int(city), eval(desc)[:args.NUM_EVENT_DESC],
+                                  user, group, int(label))
+                if user not in train_user_id or group not in train_group_id:
+                    new_test_behavior.append(behavior_tuple)
+                elif train_user_id[
+                        user] <= args.COLD_USER_THRES or train_group_id[
+                            group] <= args.COLD_GROUP_THRES:
+                    cold_test_behavior.append(behavior_tuple)
+                else:
+                    hot_test_behavior.append(behavior_tuple)
 
         with open(
                 os.path.join(args.DATA_PATH,
@@ -212,6 +226,7 @@ else:
                 'train_behavior': train_behavior,
                 'hot_test_behavior': hot_test_behavior,
                 'cold_test_behavior': cold_test_behavior,
+                'new_test_behavior': new_test_behavior,
                 'total_user_group': total_user_group,
                 'total_user_user': total_user_user,
             }, f)
@@ -224,6 +239,8 @@ print(f'Number of hot testing behaviors: {len(hot_test_behavior)}, \
 {math.ceil(len(hot_test_behavior) // args.BATCH_SIZE)} steps')
 print(f'Number of cold testing behaviors: {len(cold_test_behavior)}, \
 {math.ceil(len(cold_test_behavior) // args.BATCH_SIZE)} steps')
+print(f'Number of new testing behaviors: {len(new_test_behavior)}, \
+{math.ceil(len(new_test_behavior) // args.BATCH_SIZE)} steps')
 
 # %%
 # prepare graph without self-loop
@@ -611,6 +628,10 @@ def run(mode):
         cold_test_dataloader = DataLoader(cold_test_dataset,
                                           batch_size=args.BATCH_SIZE,
                                           shuffle=False)
+        new_test_dataset = MyDataset(new_test_behavior)
+        new_test_dataloader = DataLoader(new_test_dataset,
+                                         batch_size=args.BATCH_SIZE,
+                                         shuffle=False)
         model.eval()
         torch.set_grad_enabled(False)
         best_AUC = 0
@@ -621,80 +642,72 @@ def run(mode):
             model.load_state_dict(checkpoint)
             model.build_graph(val_test_graph.to(device, non_blocking=True))
 
-            hot_pred, hot_truth = [], []
-            for (event_city, event_desc, user_id, user_topic, user_city,
-                 group_id, group_topic, group_city, group_desc,
-                 label) in tqdm(hot_test_dataloader):
-                event_city = event_city.to(device, non_blocking=True)
-                event_desc = event_desc.to(device, non_blocking=True)
-                user_id = user_id.to(device, non_blocking=True)
-                user_topic = user_topic.to(device, non_blocking=True)
-                user_city = user_city.to(device, non_blocking=True)
-                group_id = group_id.to(device, non_blocking=True)
-                group_topic = group_topic.to(device, non_blocking=True)
-                group_city = group_city.to(device, non_blocking=True)
-                group_desc = group_desc.to(device, non_blocking=True)
-                label = label.float().to(device, non_blocking=True)
+            pred = {'hot': [], 'cold': [], 'new': []}
+            truth = {'hot': [], 'cold': [], 'new': []}
+            metrics = {'hot': None, 'cold': None, 'new': None}
 
-                y_hat, _ = model(event_city, event_desc, user_id, user_topic,
-                                 user_city, group_id, group_topic, group_city,
-                                 group_desc, label)
-                hot_pred.extend(y_hat.to('cpu').detach().numpy())
-                hot_truth.extend(label.to('cpu').detach().numpy())
+            for name, dataloader in zip(['hot', 'cold', 'new'], [
+                    hot_test_dataloader, cold_test_dataloader,
+                    new_test_dataloader
+            ]):
+                for (event_city, event_desc, user_id, user_topic, user_city,
+                     group_id, group_topic, group_city, group_desc,
+                     label) in tqdm(dataloader):
+                    event_city = event_city.to(device, non_blocking=True)
+                    event_desc = event_desc.to(device, non_blocking=True)
+                    user_id = user_id.to(device, non_blocking=True)
+                    user_topic = user_topic.to(device, non_blocking=True)
+                    user_city = user_city.to(device, non_blocking=True)
+                    group_id = group_id.to(device, non_blocking=True)
+                    group_topic = group_topic.to(device, non_blocking=True)
+                    group_city = group_city.to(device, non_blocking=True)
+                    group_desc = group_desc.to(device, non_blocking=True)
+                    label = label.float().to(device, non_blocking=True)
 
-            cold_pred, cold_truth = [], []
-            for (event_city, event_desc, user_id, user_topic, user_city,
-                 group_id, group_topic, group_city, group_desc,
-                 label) in tqdm(cold_test_dataloader):
-                event_city = event_city.to(device, non_blocking=True)
-                event_desc = event_desc.to(device, non_blocking=True)
-                user_id = user_id.to(device, non_blocking=True)
-                user_topic = user_topic.to(device, non_blocking=True)
-                user_city = user_city.to(device, non_blocking=True)
-                group_id = group_id.to(device, non_blocking=True)
-                group_topic = group_topic.to(device, non_blocking=True)
-                group_city = group_city.to(device, non_blocking=True)
-                group_desc = group_desc.to(device, non_blocking=True)
-                label = label.float().to(device, non_blocking=True)
+                    y_hat, _ = model(event_city, event_desc, user_id,
+                                     user_topic, user_city, group_id,
+                                     group_topic, group_city, group_desc,
+                                     label)
+                    pred[name].extend(y_hat.to('cpu').detach().numpy())
+                    truth[name].extend(label.to('cpu').detach().numpy())
+                metrics[name] = calculate_metrics(pred[name], truth[name])
 
-                y_hat, _ = model(event_city, event_desc, user_id, user_topic,
-                                 user_city, group_id, group_topic, group_city,
-                                 group_desc, label)
-                cold_pred.extend(y_hat.to('cpu').detach().numpy())
-                cold_truth.extend(label.to('cpu').detach().numpy())
-
-            total_pred = hot_pred + cold_pred
-            total_truth = hot_truth + cold_truth
-            hot_metrics = calculate_metrics(hot_pred, hot_truth)
-            cold_metrics = calculate_metrics(cold_pred, cold_truth)
+            total_pred = pred['hot'] + pred['cold'] + pred['new']
+            total_truth = truth['hot'] + truth['cold'] + truth['new']
             overall_metrics = calculate_metrics(total_pred, total_truth)
+            metrics['overall'] = overall_metrics
 
             if args.USE_WANDB:
                 wandb.log({
-                    'test/hot/accuracy': hot_metrics[0],
-                    'test/hot/precision': hot_metrics[1],
-                    'test/hot/recall': hot_metrics[2],
-                    'test/hot/f1': hot_metrics[3],
-                    'test/hot/AUC': hot_metrics[4],
-                    'test/cold/accuracy': cold_metrics[0],
-                    'test/cold/precision': cold_metrics[1],
-                    'test/cold/recall': cold_metrics[2],
-                    'test/cold/f1': cold_metrics[3],
-                    'test/cold/AUC': cold_metrics[4],
-                    'test/overall/accuracy': overall_metrics[0],
-                    'test/overall/precision': overall_metrics[1],
-                    'test/overall/recall': overall_metrics[2],
-                    'test/overall/f1': overall_metrics[3],
-                    'test/overall/AUC': overall_metrics[4],
+                    'test/hot/accuracy': metrics['hot'][0],
+                    'test/hot/precision': metrics['hot'][1],
+                    'test/hot/recall': metrics['hot'][2],
+                    'test/hot/f1': metrics['hot'][3],
+                    'test/hot/AUC': metrics['hot'][4],
+                    'test/cold/accuracy': metrics['cold'][0],
+                    'test/cold/precision': metrics['cold'][1],
+                    'test/cold/recall': metrics['cold'][2],
+                    'test/cold/f1': metrics['cold'][3],
+                    'test/cold/AUC': metrics['cold'][4],
+                    'test/new/accuracy': metrics['new'][0],
+                    'test/new/precision': metrics['new'][1],
+                    'test/new/recall': metrics['new'][2],
+                    'test/new/f1': metrics['new'][3],
+                    'test/new/AUC': metrics['new'][4],
+                    'test/overall/accuracy': metrics['overall'][0],
+                    'test/overall/precision': metrics['overall'][1],
+                    'test/overall/recall': metrics['overall'][2],
+                    'test/overall/f1': metrics['overall'][3],
+                    'test/overall/AUC': metrics['overall'][4],
                     'test/step': step
                 })
 
-                if overall_metrics[4] > best_AUC:
-                    wandb.run.summary['best_accuracy'] = overall_metrics[0]
-                    wandb.run.summary['best_precision'] = overall_metrics[1]
-                    wandb.run.summary['best_recall'] = overall_metrics[2]
-                    wandb.run.summary['best_f1'] = overall_metrics[3]
-                    wandb.run.summary['best_AUC'] = overall_metrics[4]
+                if metrics['overall'][4] > best_AUC:
+                    wandb.run.summary['best_accuracy'] = metrics['overall'][0]
+                    wandb.run.summary['best_precision'] = metrics['overall'][1]
+                    wandb.run.summary['best_recall'] = metrics['overall'][2]
+                    wandb.run.summary['best_f1'] = metrics['overall'][3]
+                    wandb.run.summary['best_AUC'] = metrics['overall'][4]
                     wandb.run.summary['best_step'] = step
                     best_AUC = overall_metrics[4]
 
