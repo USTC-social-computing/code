@@ -61,7 +61,7 @@ class Args():
         self.SAVE_STEP = 2000
         self.EPOCH = 3
         self.DECAY_RATE = 1
-        self.WEIGHT_SMOOTHING_EXPONENT = 1
+        self.WEIGHT_SMOOTHING_EXPONENT = 0.8
         self.NUM_GCN_LAYER = 2  # set to 0 to skip GCN
         self.COLD_USER_THRES = 2
         self.COLD_GROUP_THRES = 5
