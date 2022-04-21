@@ -37,7 +37,7 @@ class Args():
     def __init__(self):
         self.USE_WANDB = True
         self.RANDOM_ORDER = True
-        self.EXP_NAME = "GCN-1layer-weight-random"
+        self.EXP_NAME = "GCN-2-layer-activation"
         self.DATA_PATH = "./data"
         self.GLOVE_PATH = "/data/yflyl/glove.840B.300d.txt"
         self.MODEL_DIR = f"../../model_all/{self.EXP_NAME}"
@@ -62,7 +62,7 @@ class Args():
         self.EPOCH = 3
         self.DECAY_RATE = 1
         self.WEIGHT_SMOOTHING_EXPONENT = 1
-        self.NUM_GCN_LAYER = 1  # set to 0 to skip GCN
+        self.NUM_GCN_LAYER = 2  # set to 0 to skip GCN
         self.COLD_USER_THRES = 2
         self.COLD_GROUP_THRES = 5
 
@@ -133,7 +133,7 @@ print(f'Total group num: {NUM_GROUP}')
 
 # %%
 # prepare data
-TRAIN_NUM = 97
+TRAIN_NUM = 93
 
 total_behavior_file = sorted(
     os.listdir(os.path.join(args.DATA_PATH, 'behaviours')))
@@ -411,7 +411,7 @@ class GCN(nn.Module):
         for i, layer in enumerate(self.layers):
             h = layer(g, h, edge_weight=g.edata['weight'])
             if i != len(self.layers) - 1:
-                h = F.relu(h)
+                h = F.tanh(h)
             results.append(h)
         return torch.cat(results, dim=1)
 
@@ -628,10 +628,10 @@ def run(mode):
         cold_test_dataloader = DataLoader(cold_test_dataset,
                                           batch_size=args.BATCH_SIZE,
                                           shuffle=False)
-        new_test_dataset = MyDataset(new_test_behavior)
-        new_test_dataloader = DataLoader(new_test_dataset,
-                                         batch_size=args.BATCH_SIZE,
-                                         shuffle=False)
+        # new_test_dataset = MyDataset(new_test_behavior)
+        # new_test_dataloader = DataLoader(new_test_dataset,
+        #                                  batch_size=args.BATCH_SIZE,
+        #                                  shuffle=False)
         model.eval()
         torch.set_grad_enabled(False)
         best_AUC = 0
@@ -642,14 +642,12 @@ def run(mode):
             model.load_state_dict(checkpoint)
             model.build_graph(val_test_graph.to(device, non_blocking=True))
 
-            pred = {'hot': [], 'cold': [], 'new': []}
-            truth = {'hot': [], 'cold': [], 'new': []}
-            metrics = {'hot': None, 'cold': None, 'new': None}
+            pred = {'hot': [], 'cold': []}
+            truth = {'hot': [], 'cold': []}
+            metrics = {'hot': None, 'cold': None}
 
-            for name, dataloader in zip(['hot', 'cold', 'new'], [
-                    hot_test_dataloader, cold_test_dataloader,
-                    new_test_dataloader
-            ]):
+            for name, dataloader in zip(
+                ['hot', 'cold'], [hot_test_dataloader, cold_test_dataloader]):
                 for (event_city, event_desc, user_id, user_topic, user_city,
                      group_id, group_topic, group_city, group_desc,
                      label) in tqdm(dataloader):
@@ -672,8 +670,8 @@ def run(mode):
                     truth[name].extend(label.to('cpu').detach().numpy())
                 metrics[name] = calculate_metrics(pred[name], truth[name])
 
-            total_pred = pred['hot'] + pred['cold'] + pred['new']
-            total_truth = truth['hot'] + truth['cold'] + truth['new']
+            total_pred = pred['hot'] + pred['cold']
+            total_truth = truth['hot'] + truth['cold']
             overall_metrics = calculate_metrics(total_pred, total_truth)
             metrics['overall'] = overall_metrics
 
@@ -689,11 +687,11 @@ def run(mode):
                     'test/cold/recall': metrics['cold'][2],
                     'test/cold/f1': metrics['cold'][3],
                     'test/cold/AUC': metrics['cold'][4],
-                    'test/new/accuracy': metrics['new'][0],
-                    'test/new/precision': metrics['new'][1],
-                    'test/new/recall': metrics['new'][2],
-                    'test/new/f1': metrics['new'][3],
-                    'test/new/AUC': metrics['new'][4],
+                    # 'test/new/accuracy': metrics['new'][0],
+                    # 'test/new/precision': metrics['new'][1],
+                    # 'test/new/recall': metrics['new'][2],
+                    # 'test/new/f1': metrics['new'][3],
+                    # 'test/new/AUC': metrics['new'][4],
                     'test/overall/accuracy': metrics['overall'][0],
                     'test/overall/precision': metrics['overall'][1],
                     'test/overall/recall': metrics['overall'][2],
